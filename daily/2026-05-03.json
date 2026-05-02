@@ -1,0 +1,5 @@
+{
+  "date": "2026-05-03",
+  "topic": "UART",
+  "content": "UART (Universal Asynchronous Receiver-Transmitter) 虽是一种简单的串行协议，但在嵌入式架构设计中，其缓冲区管理和中断驱动设计至关重要。在高带宽需求下，应避免在 UART 中断服务函数(ISR)中处理协议解析，而是利用循环缓冲区(Circular Buffer)结合 DMA 将数据搬运至应用层处理，从而降低 CPU 占用并提高实时性。"
+}
