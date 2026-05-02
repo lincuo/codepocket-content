@@ -1,0 +1,50 @@
+{
+  "date": "2026-05-02",
+  "items": [
+    {
+      "id": "2026-05-02-uart-layering",
+      "title": "UART 驱动和协议解析层如何解耦",
+      "topic": "UART",
+      "mode": "architecture",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "note",
+      "difficulty": "intermediate",
+      "tags": ["UART", "架构设计", "解耦", "嵌入式C"],
+      "explanation": "协议层只依赖通信端口接口，底层 UART、USB CDC 或 SPI 都可以替换。",
+      "content": "在嵌入式项目中，常见问题是协议解析代码直接调用 UART HAL 或寄存器函数。这会让协议层难以复用，也难以单元测试。更好的做法是定义 comm_port_t 这类通信端口抽象，让协议层只依赖 read/write 接口。这样底层可以是 UART、USB CDC、SPI 或模拟测试桩。代价是多了一层接口设计，需要团队保持概念完整性，避免抽象过度。",
+      "code": "typedef struct {\\n    int (*read)(unsigned char *buf, unsigned int len);\\n    int (*write)(const unsigned char *buf, unsigned int len);\\n} comm_port_t;\\n\\nint protocol_poll(comm_port_t *port) {\\n    unsigned char frame[64];\\n    int len = port->read(frame, sizeof(frame));\\n    if (len <= 0) {\\n        return 0;\\n    }\\n\\n    /* 协议层只处理帧，不关心底层来自 UART、USB CDC 还是 SPI */\\n    return len;\\n}"
+    },
+    {
+      "id": "2026-05-02-i2c-register-map",
+      "title": "I2C 设备驱动要先设计寄存器映射层",
+      "topic": "I2C",
+      "mode": "refactor",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "note",
+      "difficulty": "intermediate",
+      "tags": ["I2C", "驱动分层", "寄存器映射"],
+      "explanation": "把 I2C 总线访问和设备寄存器语义拆开，能减少业务层对芯片细节的依赖。",
+      "content": "很多 I2C 传感器驱动一开始会把总线读写、寄存器地址、数据换算和业务判断写在一起。短期很快，长期会变成难以迁移的硬编码。建议拆成三层：bus 层负责 I2C 字节传输，device 层负责寄存器语义，app 层负责业务策略。这样更符合信息隐藏原则，移植到新芯片或替换传感器时影响范围更小。",
+      "code": "/* bus 层：只负责 I2C 字节传输 */\\nint i2c_bus_read(unsigned char addr, unsigned char reg, unsigned char *buf, unsigned int len);\\nint i2c_bus_write(unsigned char addr, unsigned char reg, const unsigned char *buf, unsigned int len);\\n\\n/* device 层：封装具体芯片寄存器 */\\nint sensor_read_temperature(int *temperature);\\n\\n/* app 层：只关心业务阈值和状态 */\\nvoid temperature_service_poll(void);"
+    },
+    {
+      "id": "2026-05-02-freertos-queue-boundary",
+      "title": "FreeRTOS 队列不是万能消息总线",
+      "topic": "FreeRTOS",
+      "mode": "tip",
+      "language": "C",
+      "platform": "FreeRTOS",
+      "toolchain": "GCC",
+      "snippetType": "rtos",
+      "difficulty": "intermediate",
+      "tags": ["FreeRTOS", "队列", "架构权衡"],
+      "explanation": "队列适合跨任务传递所有权明确的数据，但过度使用会隐藏模块依赖。",
+      "content": "FreeRTOS 队列很好用，但如果所有模块都往一个大队列里塞事件，系统依赖会变得隐蔽。调试时你会很难判断事件来源、消费顺序和拥塞原因。更稳的做法是让队列服务于明确边界：例如通信任务向协议任务传帧，采样任务向滤波任务传数据。队列不是架构本身，它只是模块边界上的通信机制。",
+      "code": "typedef enum {\\n    EVT_UART_RX,\\n    EVT_SENSOR_READY,\\n    EVT_TIMEOUT\\n} app_event_type_t;\\n\\ntypedef struct {\\n    app_event_type_t type;\\n    unsigned int value;\\n} app_event_t;\\n\\n/* 建议：事件类型少而清晰，避免把所有模块都塞进同一个大队列 */"
+    }
+  ]
+}
