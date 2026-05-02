@@ -1,5 +1,65 @@
 {
   "date": "2026-05-03",
-  "topic": "UART",
-  "content": "UART (Universal Asynchronous Receiver-Transmitter) 虽是一种简单的串行协议，但在嵌入式架构设计中，其缓冲区管理和中断驱动设计至关重要。在高带宽需求下，应避免在 UART 中断服务函数(ISR)中处理协议解析，而是利用循环缓冲区(Circular Buffer)结合 DMA 将数据搬运至应用层处理，从而降低 CPU 占用并提高实时性。"
+  "items": [
+    {
+      "id": "2026-05-03-uart-architecture-layering",
+      "title": "UART 驱动和协议解析层如何解耦",
+      "topic": "UART",
+      "mode": "architecture",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "note",
+      "difficulty": "intermediate",
+      "tags": ["UART", "架构设计", "解耦", "嵌入式C"],
+      "explanation": "协议层只依赖通信端口接口，底层 UART、USB CDC 或 SPI 都可以替换，提高代码复用性。",
+      "content": "在嵌入式项目中，协议解析代码如果直接调用 UART HAL，会导致协议层难以复用和测试。更好的做法是定义通信端口抽象，让协议层只依赖 read/write 接口。这样底层可以替换为 UART、USB CDC、SPI 或测试桩。代价是多一层接口，需要团队保持抽象边界清晰，不要在协议层直接包含 HAL 头文件。",
+      "code": "typedef struct {\n    int (*read)(unsigned char *buf, unsigned int len);\n    int (*write)(const unsigned char *buf, unsigned int len);\n} comm_port_t;\n\n// 协议层只依赖 comm_port_t，不关心底层实现\nint protocol_parse(comm_port_t *port, packet_t *out) {\n    unsigned char len_byte;\n    port->read(&len_byte, 1);\n    // ... 解析逻辑\n}\n\n// 底层可以切换\ncomm_port_t uart_port = { .read = uart_read, .write = uart_write };\ncomm_port_t usb_port = { .read = usb_read, .write = usb_write };"
+    },
+    {
+      "id": "2026-05-03-i2c-driver-eeprom-read",
+      "title": "I2C EEPROM 读取的两种方式对比",
+      "topic": "I2C",
+      "mode": "snippet",
+      "language": "C",
+      "platform": "STM32",
+      "toolchain": "HAL",
+      "snippetType": "driver",
+      "difficulty": "beginner",
+      "tags": ["I2C", "EEPROM", "驱动", "STM32"],
+      "explanation": "轮询方式适合低并发场景，中断方式适合与 DMA 配合处理多字节连续传输。",
+      "content": "I2C EEPROM 读取通常有两种方式：轮询和中断。轮询方式简单但阻塞 CPU，适合低带宽场景。中断或 DMA 方式可以释放 CPU，适合需要同时处理其他任务的场景。注意：I2C 总线竞争和 EEPROM 写入间隔是常见的踩坑点，某些 EEPROM 需要 5-10ms 的写入时间，期间不能响应新请求。",
+      "code": "// 轮询方式（简单阻塞）\nHAL_StatusTypeDef EEPROM_Read(I2C_HandleTypeDef *hi2c, uint16_t addr, uint8_t *buf, uint16_t len) {\n    HAL_I2C_Mem_Read(hi2c, EEPROM_ADDR, addr, I2C_MEMADD_SIZE_16BIT, buf, len, 1000);\n}\n\n// 带写入间隔检查的版本\nHAL_StatusTypeDef EEPROM_SafeRead(I2C_HandleTypeDef *hi2c, uint16_t addr, uint8_t *buf, uint16_t len) {\n    if (HAL_GetTick() - last_write_tick < EEPROM_WRITE_TIME_MS) {\n        return HAL_TIMEOUT; // 写入未完成，稍后再试\n    }\n    return HAL_I2C_Mem_Read(hi2c, EEPROM_ADDR, addr, I2C_MEMADD_SIZE_16BIT, buf, len, 1000);\n}"
+    },
+    {
+      "id": "2026-05-03-dma-circular-buffer",
+      "title": "DMA 配合循环缓冲区实现零拷贝 UART 接收",
+      "topic": "DMA",
+      "mode": "tip",
+      "language": "C",
+      "platform": "STM32",
+      "toolchain": "HAL",
+      "snippetType": "driver",
+      "difficulty": "advanced",
+      "tags": ["DMA", "UART", "循环缓冲区", "零拷贝", "STM32"],
+      "explanation": "使用 DMA 循环模式配合循环缓冲区，可以在不丢字节的前提下实现 UART 高速接收。",
+      "content": "传统中断驱动的 UART 接收在高频场景下容易丢字节。DMA 循环模式可以将数据直接从外设搬运到内存，配合循环缓冲区，上层应用可以按需读取数据。关键点：1) DMA 目标地址固定，长度等于缓冲区大小；2) 需要记录已读和未读指针；3) 缓冲区大小应预留足够余量应对突发数据；4) 中断或轮询方式判断新数据到达。涉及 DMA 和 UART 共享变量时，记得加 volatile 和适当的内存屏障。",
+      "code": "#define RX_BUF_SIZE 256\nstatic volatile uint8_t dma_rx_buf[RX_BUF_SIZE];\nstatic uint16_t rx_write_idx = 0;\n\n// DMA 完成中断中更新写位置\nvoid DMA1_Channel5_IRQHandler(void) {\n    if (DMA1->ISR & DMA_ISR_TCIF3) {\n        DMA1->IFCR = DMA_IFCR_CTCF3;\n        rx_write_idx = RX_BUF_SIZE; // 接收到了 BUF_SIZE 字节\n    }\n}\n\n// 应用层读取数据（非阻塞）\nint uart_read_bytes(uint8_t *out, uint16_t max_len) {\n    uint16_t curr = RX_BUF_SIZE - __HAL_DMA_GET_COUNTER(&hdma_usart1_rx); // DMA 剩余计数\n    if (curr == rx_write_idx) return 0; // 无新数据\n    uint16_t len = (rx_write_idx > curr) ? rx_write_idx - curr : RX_BUF_SIZE - curr + rx_write_idx;\n    if (len > max_len) len = max_len;\n    // ... 复制数据并更新读指针\n    return len;\n}"
+    },
+    {
+      "id": "2026-05-03-fsm-enum-switch",
+      "title": "用枚举和 switch 实现轻量级状态机",
+      "topic": "状态机",
+      "mode": "refactor",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "algorithm",
+      "difficulty": "beginner",
+      "tags": ["状态机", "枚举", "嵌入式C", "重构"],
+      "explanation": "相比全局变量加大量 if-else，枚举 + switch 的状态机结构更清晰，状态流转一目了然。",
+      "content": "很多嵌入式项目用大量 if-else 和全局变量管理状态，代码臃肿且难以维护。改用枚举定义状态、switch 处理状态转换，代码结构清晰很多。重构步骤：1) 用枚举替代魔法数字状态；2) 将状态转换逻辑提取到独立函数；3) 每个状态 case 尽量短小，超长则拆分子函数。风险：状态机复杂度超过 10 个状态时，考虑引入状态表或 RTOS 事件驱动。",
+      "code": "typedef enum {\n    STATE_IDLE,\n    STATE_CONNECTING,\n    STATE_WORKING,\n    STATE_ERROR,\n    STATE_RECONNECTING\n} device_state_t;\n\nstatic device_state_t current_state = STATE_IDLE;\n\nvoid state_machine_handle_event(event_t event) {\n    device_state_t prev = current_state;\n    switch (current_state) {\n        case STATE_IDLE:\n            if (event == EV_START) {\n                current_state = STATE_CONNECTING;\n                do_connect();\n            }\n            break;\n        case STATE_CONNECTING:\n            if (event == EV_SUCCESS) current_state = STATE_WORKING;\n            else if (event == EV_FAIL) current_state = STATE_ERROR;\n            break;\n        case STATE_WORKING:\n            if (event == EV_TIMEOUT) current_state = STATE_RECONNECTING;\n            else if (event == EV_STOP) current_state = STATE_IDLE;\n            break;\n        case STATE_ERROR:\n        case STATE_RECONNECTING:\n            if (event == EV_RESET || event == EV_TIMEOUT_EXPIRED) current_state = STATE_IDLE;\n            break;\n    }\n    if (prev != current_state) {\n        on_state_exit(prev);\n        on_state_enter(current_state);\n    }\n}"
+    }
+  ]
 }
