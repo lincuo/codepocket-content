@@ -1,100 +1,74 @@
 {
   "date": "2026-05-05",
-  "topic": "DMA + 循环缓冲区的正确姿势",
+  "topic": "嵌入式 C 的模块解耦（全局变量之恶）",
   "items": [
     {
       "id": "2026-05-05-arch",
-      "title": "DMA 循环缓冲区的架构分层",
-      "topic": "DMA + 循环缓冲区的正确姿势",
+      "title": "全局变量的围墙：模块解耦的架构思维",
+      "topic": "模块解耦",
       "mode": "architecture",
       "language": "C",
-      "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
       "snippetType": "pattern",
       "difficulty": "advanced",
-      "tags": [
-        "DMA",
-        "架构",
-        "设计模式"
-      ],
-      "explanation": "「软件设计的本质在于解耦，而不是增加复杂性。」——《UNIX编程艺术》",
-      "content": "\n在嵌入式系统中，DMA（直接存储器访问）配合循环缓冲区是高性能数据采集的基石。采用《C语言接口与实现》中的模块原则，我们将DMA抽象为生产者，将处理逻辑抽象为消费者。这种设计遵循 UNIX 编程艺术中的“组合性”，即将数据流与业务逻辑解耦。\n\n架构的核心在于“半满中断”（Half-Transfer Interrupt）与“传输完成中断”（Transfer Complete Interrupt）的双缓存切换。通过接口定义 `Buffer_Read()` 与 `Buffer_Write()`，上层应用无需关注 DMA 搬运过程。虽然这种方案显著减轻了 CPU 负载，但必须警惕由于共享内存导致的竞争条件。正如《人月神话》中所述，系统复杂度并未消失，只是被转移到了硬件配置与内存管理层。\n",
-      "code": "// 接口定义：\nvoid Buffer_Init(RingBuffer *rb);\nbool Buffer_IsFull(RingBuffer *rb);",
+      "tags": ["架构", "解耦", "可维护性"],
+      "explanation": "全局变量是嵌入式系统中的“魔鬼”，它打破了信息隐藏的原则，使得模块间的依赖关系变得极其混乱，必须通过明确的接口进行管理。「模块原则要求我们尽量减少模块间的全局状态，以维持系统的清晰结构和可预测性。」——《UNIX编程艺术》",
+      "content": "全局变量虽然在嵌入式系统中因为节省存储空间和调用速度快而被频繁使用，但它是导致系统脆弱的元凶。在架构层面，我们需要建立“围墙”。利用 C 语言的 static 关键字，将状态限制在模块文件作用域内，仅通过 getter 和 setter 函数暴露接口。虽然这会带来函数调用的开销，但对于可维护性和调试复杂度而言，这种权衡是完全值得的。我们需要意识到，没有完美的架构，只有最适合当前复杂度的折中方案，这正是《人月神话》中没有银弹理论的体现。",
+      "code": "/* 伪代码：模块内部隐藏状态 */\nstatic volatile uint32_t system_tick_count = 0;\n\n/* 仅通过接口暴露读取能力，保护了状态的完整性 */\nuint32_t Get_System_Ticks(void) {\n    return system_tick_count;\n}",
       "pitfalls": [],
-      "refBook": [
-        "《C语言接口与实现》",
-        "《UNIX编程艺术》"
-      ]
+      "refBook": ["《UNIX编程艺术》", "《人月神话》"]
     },
     {
       "id": "2026-05-05-snippet",
-      "title": "DMA 半满中断回调实现",
-      "topic": "DMA + 循环缓冲区的正确姿势",
+      "title": "驱动层的优雅：基于句柄的模块化实现",
+      "topic": "驱动分层",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": [
-        "DMA",
-        "中断"
-      ],
-      "explanation": "「简洁的函数应只做一件事，并把它做好。」——《代码大全》",
-      "content": "使用 STM32 HAL 的回调函数机制实现对循环缓冲区的 DMA 分段读取。",
-      "code": "\n/* STM32 HAL DMA 循环缓冲区配置示例 */\n#define BUFFER_SIZE 1024\nuint8_t rx_buffer[BUFFER_SIZE];\nvolatile uint16_t head = 0;\n\nvoid HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {\n    /* DMA 已完成前半部分传输 */\n    Process_Data(&rx_buffer[0], BUFFER_SIZE / 2);\n}\n\nvoid HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {\n    /* DMA 已完成整个缓冲区传输 */\n    Process_Data(&rx_buffer[BUFFER_SIZE / 2], BUFFER_SIZE / 2);\n}\n\n/* 初始化配置 */\nvoid DMA_Init(void) {\n    // 必须确保中断优先级设置合适，防止被高优先级任务阻塞\n    HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);\n    HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);\n    \n    // 启动循环模式\n    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)rx_buffer, BUFFER_SIZE);\n}\n",
-      "pitfalls": [],
-      "refBook": [
-        "《代码大全》"
-      ]
+      "tags": ["HAL", "结构体", "驱动"],
+      "explanation": "通过定义模块句柄结构体，将原本分散在全局的资源集中管理，是提升代码复用性的关键一步。「好的接口应当像一个黑盒，使用者只需知道其输入和输出，无需关心其内部实现。」——《C语言接口与实现》",
+      "content": "在 STM32 项目中，我们常习惯直接操作全局变量操作硬件。更好的方式是使用句柄模式，将模块所需的硬件资源和状态封装在一个结构体中，使得同一类型的模块可以在系统中实例化多次。",
+      "code": "typedef struct {\n    UART_HandleTypeDef *huart;\n    uint8_t buffer[64];\n    uint16_t head;\n} Serial_Device_t;\n\n/* 驱动初始化：传入句柄，实现解耦 */\nvoid Serial_Init(Serial_Device_t *dev, UART_HandleTypeDef *huart) {\n    dev->huart = huart;\n    dev->head = 0;\n    /* 使能串口中断：配置优先级，确保不被抢占 */\n    HAL_UART_Receive_IT(dev->huart, &dev->buffer[0], 1);\n}",
+      "pitfalls": ["陷阱1：结构体指针未初始化 → 调用时死机 → 初始化时手动置空", "陷阱2：HAL中断未在NVIC开启 → 串口无响应 → 检查STM32CubeMX中断配置", "陷阱3：多个实例混用同一串口句柄 → 数据错乱 → 严格限制单个句柄对应一个UART"],
+      "refBook": ["《C语言接口与实现》"]
     },
     {
       "id": "2026-05-05-tip",
-      "title": "DMA 开发常见踩坑警示",
-      "topic": "DMA + 循环缓冲区的正确姿势",
+      "title": "嵌入式开发的陷阱：中断中的易变数据",
+      "topic": "踩坑警示",
       "mode": "tip",
       "language": "C",
       "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "toolchain": "GCC",
       "snippetType": "note",
       "difficulty": "intermediate",
-      "tags": [
-        "踩坑",
-        "DMA"
-      ],
-      "explanation": "「复杂性是软件的死敌。」——《C陷阱与缺陷》",
-      "content": "在 STM32 环境下，DMA 并非绝对的透明，尤其是对于 Cache 与标志位的管理。",
-      "code": "/* 必须注意 Cache 无效化 */\nSCB_InvalidateDCache_by_Addr((uint32_t*)rx_buffer, BUFFER_SIZE);",
-      "pitfalls": [
-        "陷阱1：缓存一致性问题 (Data Cache Coherency) → 启用 CPU 缓存的芯片(如 Cortex-M7)读取到旧数据 → 修复：使用内存屏障指令 `SCB_InvalidateDCache_by_Addr` 或将缓冲区地址配置为 MPU 无缓存区域。",
-        "陷阱2：未清除标志位导致死循环 → DMA 传输完成但在中断处理中未显式调用 `__HAL_DMA_CLEAR_FLAG` → 修复：在回调函数执行结束前务必清理标志位。",
-        "陷阱3：缓冲区越界处理 → 数据处理函数处理速度慢于 DMA 搬运速度，导致旧数据被覆盖 → 修复：增加缓冲区大小或提升系统频率，并设置环形队列状态机监控 Overflow 标志。"
-      ],
-      "refBook": [
-        "《C陷阱与缺陷》"
-      ]
+      "tags": ["中断", "volatile", "陷阱"],
+      "explanation": "在多线程或中断环境下，对全局变量的访问必须极为谨慎，否则编译器会因为过度优化而产生致命错误。「编译器是你的朋友，但如果没用好它，它会用优化破坏你的逻辑。」——《C陷阱与缺陷》",
+      "content": "处理全局变量或共享内存时，必须正确使用 volatile 关键字，防止编译器将变量缓存到 CPU 寄存器中，导致无法获取硬件最新状态。",
+      "code": "/* 必须使用 volatile */\nstatic volatile uint8_t g_uart_rx_ready = 0;\n\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    g_uart_rx_ready = 1; // 在中断中置位\n}",
+      "pitfalls": ["陷阱1：未加volatile关键字 → 主循环while(g_uart_rx_ready == 0)死循环 → 添加volatile", "陷阱2：中断未清除标志位 → 中断无限触发 → 先清除回调标志", "陷阱3：大对象未关闭中断直接修改 → 数据读写撕裂 → 进入原子保护区"],
+      "refBook": ["《C陷阱与缺陷》"]
     },
     {
       "id": "2026-05-05-refactor",
-      "title": "从全局变量到封装接口的重构",
-      "topic": "DMA + 循环缓冲区的正确姿势",
+      "title": "重构：剔除模块坏味道",
+      "topic": "重构",
       "mode": "refactor",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "GCC",
+      "platform": "STM32LL",
+      "toolchain": "LL",
       "snippetType": "pattern",
-      "difficulty": "intermediate",
-      "tags": [
-        "重构",
-        "解耦"
-      ],
-      "explanation": "「代码的坏味道往往源于共享的状态。」——《重构》",
-      "content": "重构前后的对比展示了信息隐藏的重要性，通过封装 RingBuffer 结构体，隔离了底层 DMA 的直接内存引用。",
-      "code": "// Before:\n\n// 坏味道：直接操作全局数组，耦合度高，不安全\nuint8_t buffer[1024];\nvoid ADC_Handler() { \n    if(buffer[10] > 100) { do_something(); } \n}\n\n\n// After:\n\n// 改进：使用接口封装与私有化数据\ntypedef struct { uint8_t *ptr; size_t size; } RingBuffer;\nstatic RingBuffer g_adc_ring = {rx_buffer, 1024};\n\nvoid Process_Adc_Data(RingBuffer *rb) {\n    if(rb->ptr[10] > 100) { do_something(); }\n}\n",
-      "pitfalls": [],
-      "refBook": [
-        "《重构》"
-      ]
+      "difficulty": "advanced",
+      "tags": ["重构", "LL", "性能"],
+      "explanation": "重构不是推倒重来，而是逐步剔除代码中的“坏味道”，让逻辑变得更加清晰、可测试。「代码中的坏味道，通常意味着结构设计的缺失。」——《重构》",
+      "content": "改进前，代码直接在主循环操作寄存器；改进后，封装为 LL 层 API。代价是少量函数调用开销，但显著提升了可读性。",
+      "code": "// 改进前（坏味道）：\n// LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_5);\n\n// 改进后（封装）：\nvoid LED_On(void) {\n    LL_GPIO_SetOutputPin(GPIOA, LL_GPIO_PIN_5);\n}",
+      "pitfalls": ["陷阱1：重构引入编译器额外开销 → 实时性下降 → 对频繁调用函数使用inline", "陷阱2：逻辑封装过头 → 难以定位寄存器映射 → 保持API与寄存器操作逻辑对应", "陷阱3：单元测试覆盖不足 → 重构破坏旧逻辑 → 增加模块级测试点"],
+      "refBook": ["《重构》"]
     }
   ]
 }
