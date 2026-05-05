@@ -1,5 +1,65 @@
 {
   "date": "2026-05-05",
-  "topic": "UART",
-  "content": "UART (Universal Asynchronous Receiver/Transmitter) 是嵌入式系统中最基础的通信协议之一。在架构设计中，考虑到 UART 的异步特性，在高频通信场景下需优先考虑中断或 DMA 模式，以避免 CPU 过度忙等待（Busy-waiting）。此外，为保证不同模块间的解耦，通常在驱动层之上封装一层逻辑缓冲区或状态机，实现应用层与物理硬件的完全隔离。"
+  "items": [
+    {
+      "id": "2026-05-05-i2c-001",
+      "title": "I2C 状态机架构设计",
+      "topic": "I2C",
+      "mode": "architecture",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "HAL",
+      "snippetType": "pattern",
+      "difficulty": "advanced",
+      "tags": ["架构", "I2C", "状态机"],
+      "explanation": "采用事件驱动的状态机替代阻塞式 HAL API，实现高效的异步 I2C 通信。",
+      "content": "在嵌入式系统中，使用轮询或阻塞方式处理 I2C 容易导致系统卡顿。通过状态机架构，可以将发送、接收、停止等操作分解为多个原子状态，结合中断或 DMA 处理，能显著提高并发能力。",
+      "code": ""
+    },
+    {
+      "id": "2026-05-05-i2c-002",
+      "title": "I2C 地址扫描 snippet",
+      "topic": "I2C",
+      "mode": "snippet",
+      "language": "C",
+      "platform": "STM32",
+      "toolchain": "HAL",
+      "snippetType": "driver",
+      "difficulty": "beginner",
+      "tags": ["I2C", "调试"],
+      "explanation": "通过 HAL_I2C_IsDeviceReady 函数快速检测总线上的从设备地址。",
+      "content": "在 I2C 调试初期，通过遍历地址范围 0x01 到 0x7F，快速确认哪些设备响应，是排除硬件接线错误的第一步。",
+      "code": "for(uint8_t i=1; i<128; i++) {\n  if(HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(i<<1), 3, 5) == HAL_OK) {\n    printf(\"Found device at 0x%02X\\r\\n\", i);\n  }\n}"
+    },
+    {
+      "id": "2026-05-05-i2c-003",
+      "title": "防止 I2C 总线挂死技巧",
+      "topic": "I2C",
+      "mode": "tip",
+      "language": "C",
+      "platform": "STM32",
+      "toolchain": "HAL",
+      "snippetType": "note",
+      "difficulty": "intermediate",
+      "tags": ["I2C", "稳定性"],
+      "explanation": "通过配置 GPIO 为模拟模式手动产生时钟，解决从机拉低 SDA 导致的死锁。",
+      "content": "当从设备因为异常未释放 SDA 线时，主机无法继续通信。此时应将 I2C 引脚切换为 GPIO 输出模式，手动翻转 SCL 输出脉冲，强制从机释放总线。",
+      "code": "// 伪代码示例\nGPIO_InitTypeDef GPIO_InitStruct = {0};\nGPIO_InitStruct.Pin = GPIO_PIN_6; // SCL\nGPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;\nHAL_GPIO_Init(GPIOB, &GPIO_InitStruct);\nfor(int i=0; i<9; i++) {\n  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);\n  delay_us(5);\n  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);\n  delay_us(5);\n}"
+    },
+    {
+      "id": "2026-05-05-i2c-004",
+      "title": "重构 I2C 读取接口",
+      "topic": "I2C",
+      "mode": "refactor",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "HAL",
+      "snippetType": "algorithm",
+      "difficulty": "intermediate",
+      "tags": ["重构", "I2C"],
+      "explanation": "将散乱的寄存器读写封装为基于结构的统一接口。",
+      "content": "通过定义一个统一的 I2C 接口结构体，屏蔽底层 HAL 的复杂调用，使上层应用只需关注寄存器地址和数据缓冲区。",
+      "code": "typedef struct {\n  HAL_StatusTypeDef (*read)(uint8_t dev_addr, uint8_t reg_addr, uint8_t *pData, uint16_t size);\n} I2C_Driver;\n\n// 使用:\nmy_driver.read(0x68, 0x75, &id, 1);"
+    }
+  ]
 }
