@@ -1,65 +1,100 @@
 {
   "date": "2026-05-05",
+  "topic": "DMA + 循环缓冲区的正确姿势",
   "items": [
     {
-      "id": "2026-05-05-i2c-001",
-      "title": "I2C 状态机架构设计",
-      "topic": "I2C",
+      "id": "2026-05-05-arch",
+      "title": "DMA 循环缓冲区的架构分层",
+      "topic": "DMA + 循环缓冲区的正确姿势",
       "mode": "architecture",
       "language": "C",
-      "platform": "通用嵌入式",
+      "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "advanced",
-      "tags": ["架构", "I2C", "状态机"],
-      "explanation": "采用事件驱动的状态机替代阻塞式 HAL API，实现高效的异步 I2C 通信。",
-      "content": "在嵌入式系统中，使用轮询或阻塞方式处理 I2C 容易导致系统卡顿。通过状态机架构，可以将发送、接收、停止等操作分解为多个原子状态，结合中断或 DMA 处理，能显著提高并发能力。",
-      "code": ""
+      "tags": [
+        "DMA",
+        "架构",
+        "设计模式"
+      ],
+      "explanation": "「软件设计的本质在于解耦，而不是增加复杂性。」——《UNIX编程艺术》",
+      "content": "\n在嵌入式系统中，DMA（直接存储器访问）配合循环缓冲区是高性能数据采集的基石。采用《C语言接口与实现》中的模块原则，我们将DMA抽象为生产者，将处理逻辑抽象为消费者。这种设计遵循 UNIX 编程艺术中的“组合性”，即将数据流与业务逻辑解耦。\n\n架构的核心在于“半满中断”（Half-Transfer Interrupt）与“传输完成中断”（Transfer Complete Interrupt）的双缓存切换。通过接口定义 `Buffer_Read()` 与 `Buffer_Write()`，上层应用无需关注 DMA 搬运过程。虽然这种方案显著减轻了 CPU 负载，但必须警惕由于共享内存导致的竞争条件。正如《人月神话》中所述，系统复杂度并未消失，只是被转移到了硬件配置与内存管理层。\n",
+      "code": "// 接口定义：\nvoid Buffer_Init(RingBuffer *rb);\nbool Buffer_IsFull(RingBuffer *rb);",
+      "pitfalls": [],
+      "refBook": [
+        "《C语言接口与实现》",
+        "《UNIX编程艺术》"
+      ]
     },
     {
-      "id": "2026-05-05-i2c-002",
-      "title": "I2C 地址扫描 snippet",
-      "topic": "I2C",
+      "id": "2026-05-05-snippet",
+      "title": "DMA 半满中断回调实现",
+      "topic": "DMA + 循环缓冲区的正确姿势",
       "mode": "snippet",
       "language": "C",
-      "platform": "STM32",
+      "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "driver",
-      "difficulty": "beginner",
-      "tags": ["I2C", "调试"],
-      "explanation": "通过 HAL_I2C_IsDeviceReady 函数快速检测总线上的从设备地址。",
-      "content": "在 I2C 调试初期，通过遍历地址范围 0x01 到 0x7F，快速确认哪些设备响应，是排除硬件接线错误的第一步。",
-      "code": "for(uint8_t i=1; i<128; i++) {\n  if(HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(i<<1), 3, 5) == HAL_OK) {\n    printf(\"Found device at 0x%02X\\r\\n\", i);\n  }\n}"
+      "difficulty": "intermediate",
+      "tags": [
+        "DMA",
+        "中断"
+      ],
+      "explanation": "「简洁的函数应只做一件事，并把它做好。」——《代码大全》",
+      "content": "使用 STM32 HAL 的回调函数机制实现对循环缓冲区的 DMA 分段读取。",
+      "code": "\n/* STM32 HAL DMA 循环缓冲区配置示例 */\n#define BUFFER_SIZE 1024\nuint8_t rx_buffer[BUFFER_SIZE];\nvolatile uint16_t head = 0;\n\nvoid HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {\n    /* DMA 已完成前半部分传输 */\n    Process_Data(&rx_buffer[0], BUFFER_SIZE / 2);\n}\n\nvoid HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {\n    /* DMA 已完成整个缓冲区传输 */\n    Process_Data(&rx_buffer[BUFFER_SIZE / 2], BUFFER_SIZE / 2);\n}\n\n/* 初始化配置 */\nvoid DMA_Init(void) {\n    // 必须确保中断优先级设置合适，防止被高优先级任务阻塞\n    HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);\n    HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);\n    \n    // 启动循环模式\n    HAL_ADC_Start_DMA(&hadc1, (uint32_t*)rx_buffer, BUFFER_SIZE);\n}\n",
+      "pitfalls": [],
+      "refBook": [
+        "《代码大全》"
+      ]
     },
     {
-      "id": "2026-05-05-i2c-003",
-      "title": "防止 I2C 总线挂死技巧",
-      "topic": "I2C",
+      "id": "2026-05-05-tip",
+      "title": "DMA 开发常见踩坑警示",
+      "topic": "DMA + 循环缓冲区的正确姿势",
       "mode": "tip",
       "language": "C",
-      "platform": "STM32",
+      "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "note",
       "difficulty": "intermediate",
-      "tags": ["I2C", "稳定性"],
-      "explanation": "通过配置 GPIO 为模拟模式手动产生时钟，解决从机拉低 SDA 导致的死锁。",
-      "content": "当从设备因为异常未释放 SDA 线时，主机无法继续通信。此时应将 I2C 引脚切换为 GPIO 输出模式，手动翻转 SCL 输出脉冲，强制从机释放总线。",
-      "code": "// 伪代码示例\nGPIO_InitTypeDef GPIO_InitStruct = {0};\nGPIO_InitStruct.Pin = GPIO_PIN_6; // SCL\nGPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;\nHAL_GPIO_Init(GPIOB, &GPIO_InitStruct);\nfor(int i=0; i<9; i++) {\n  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_RESET);\n  delay_us(5);\n  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_6, GPIO_PIN_SET);\n  delay_us(5);\n}"
+      "tags": [
+        "踩坑",
+        "DMA"
+      ],
+      "explanation": "「复杂性是软件的死敌。」——《C陷阱与缺陷》",
+      "content": "在 STM32 环境下，DMA 并非绝对的透明，尤其是对于 Cache 与标志位的管理。",
+      "code": "/* 必须注意 Cache 无效化 */\nSCB_InvalidateDCache_by_Addr((uint32_t*)rx_buffer, BUFFER_SIZE);",
+      "pitfalls": [
+        "陷阱1：缓存一致性问题 (Data Cache Coherency) → 启用 CPU 缓存的芯片(如 Cortex-M7)读取到旧数据 → 修复：使用内存屏障指令 `SCB_InvalidateDCache_by_Addr` 或将缓冲区地址配置为 MPU 无缓存区域。",
+        "陷阱2：未清除标志位导致死循环 → DMA 传输完成但在中断处理中未显式调用 `__HAL_DMA_CLEAR_FLAG` → 修复：在回调函数执行结束前务必清理标志位。",
+        "陷阱3：缓冲区越界处理 → 数据处理函数处理速度慢于 DMA 搬运速度，导致旧数据被覆盖 → 修复：增加缓冲区大小或提升系统频率，并设置环形队列状态机监控 Overflow 标志。"
+      ],
+      "refBook": [
+        "《C陷阱与缺陷》"
+      ]
     },
     {
-      "id": "2026-05-05-i2c-004",
-      "title": "重构 I2C 读取接口",
-      "topic": "I2C",
+      "id": "2026-05-05-refactor",
+      "title": "从全局变量到封装接口的重构",
+      "topic": "DMA + 循环缓冲区的正确姿势",
       "mode": "refactor",
       "language": "C",
       "platform": "通用嵌入式",
-      "toolchain": "HAL",
-      "snippetType": "algorithm",
+      "toolchain": "GCC",
+      "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["重构", "I2C"],
-      "explanation": "将散乱的寄存器读写封装为基于结构的统一接口。",
-      "content": "通过定义一个统一的 I2C 接口结构体，屏蔽底层 HAL 的复杂调用，使上层应用只需关注寄存器地址和数据缓冲区。",
-      "code": "typedef struct {\n  HAL_StatusTypeDef (*read)(uint8_t dev_addr, uint8_t reg_addr, uint8_t *pData, uint16_t size);\n} I2C_Driver;\n\n// 使用:\nmy_driver.read(0x68, 0x75, &id, 1);"
+      "tags": [
+        "重构",
+        "解耦"
+      ],
+      "explanation": "「代码的坏味道往往源于共享的状态。」——《重构》",
+      "content": "重构前后的对比展示了信息隐藏的重要性，通过封装 RingBuffer 结构体，隔离了底层 DMA 的直接内存引用。",
+      "code": "// Before:\n\n// 坏味道：直接操作全局数组，耦合度高，不安全\nuint8_t buffer[1024];\nvoid ADC_Handler() { \n    if(buffer[10] > 100) { do_something(); } \n}\n\n\n// After:\n\n// 改进：使用接口封装与私有化数据\ntypedef struct { uint8_t *ptr; size_t size; } RingBuffer;\nstatic RingBuffer g_adc_ring = {rx_buffer, 1024};\n\nvoid Process_Adc_Data(RingBuffer *rb) {\n    if(rb->ptr[10] > 100) { do_something(); }\n}\n",
+      "pitfalls": [],
+      "refBook": [
+        "《重构》"
+      ]
     }
   ]
 }
