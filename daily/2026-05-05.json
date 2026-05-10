@@ -1,115 +1,74 @@
 {
   "date": "2026-05-05",
-  "topic": "DMA + 循环缓冲区的正确姿势",
+  "topic": "嵌入式 C 的模块解耦（全局变量之恶）",
   "items": [
     {
-      "id": "2026-05-05-dma-arch",
-      "title": "DMA 循环缓冲的层级抽象设计",
-      "topic": "DMA 循环缓冲区",
+      "id": "2026-05-05-architecture",
+      "title": "全局变量的围墙：从信息隐藏到模块接口",
+      "topic": "模块解耦",
       "mode": "architecture",
       "language": "C",
       "platform": "通用嵌入式",
       "toolchain": "GCC",
       "snippetType": "pattern",
-      "difficulty": "advanced",
-      "tags": [
-        "DMA",
-        "环形缓冲区",
-        "解耦"
-      ],
-      "explanation": "设计决定系统寿命，而非代码行数。「在 C 语言中，接口是模块的契约，隐藏了实现细节，使得硬件抽象成为可能。」——《C语言接口与实现》",
-      "content": "在嵌入式系统中，将 DMA 与环形缓冲区（Circular Buffer）结合时，必须严格遵守信息隐藏原则。架构上应将‘硬件控制层’（DMA 配置、寄存器操作）与‘数据逻辑层’（缓冲区读写、溢出检查、索引管理）解耦。通过提供 API（如 ring_buffer_push, ring_buffer_pop）而非直接操作缓冲数组，使得上层应用无需关心数据是如何通过 DMA 从 USART/ADC 搬运进来的。这种抽象的好处是可测试性增强，且在更换 MCU 平台时只需重写硬件层。然而，这种抽象引入了函数调用开销和潜在的原子性问题，在极度苛刻的实时性能环境下，需要通过内联函数或宏进行权衡。「没有单一的、简单的解决方法能够解决软件开发中每一部分的困难。」——《人月神话》",
-      "code": "// 接口定义示例\nstruct ring_buffer {\n    uint8_t *buffer;\n    size_t head;\n    size_t tail;\n    size_t size;\n};\n// API 契约\nint rb_init(struct ring_buffer *rb, uint8_t *buf, size_t size);\nsize_t rb_write(struct ring_buffer *rb, const uint8_t *data, size_t len);\nsize_t rb_read(struct ring_buffer *rb, uint8_t *data, size_t len);",
-      "pitfalls": [
-        "陷阱1：DMA 传输未完成即读取 → 脏数据 → 必须在回调函数更新尾索引",
-        "陷阱2：中断优先级过低 → FIFO 溢出 → 必须将 DMA 中断优先级设为最高且不能被耗时任务阻塞",
-        "陷阱3：内存一致性（Cache）未刷新 → 硬件修改数据未更新至 CPU 视图 → 必须使用内存屏障或 Cache 无效化指令"
-      ],
-      "refBook": [
-        "《C语言接口与实现》Ch2",
-        "《人月神话》Ch16"
-      ]
+      "difficulty": "intermediate",
+      "tags": ["架构", "解耦"],
+      "explanation": "遵循模块化设计原则，我们不再将全局结构体暴露在头文件中，而是通过存取器函数实现受控访问，这正是《C语言接口与实现》所强调的抽象数据类型之精髓。「信息隐藏的目的是为了减少模块间的耦合，从而降低系统的维护成本。」——《C语言接口与实现》",
+      "content": "在裸机编程中，开发者常通过 'extern struct GlobalConfig_t config' 将状态散布各处。这导致代码耦合度极高：一旦修改 config 的结构，所有关联模块都需要重新编译。更好的架构是将全局状态封装于实现文件 (.c) 内部，声明静态变量，并对外提供受控的 Get/Set 接口。例如，通过 'Config_GetThreshold()' 代替直接访问，不仅能实现只读访问限制，还能在此处埋点做参数校验，或添加互斥锁以防多任务环境下的一致性破坏。这虽增加了函数调用开销，但在大型固件项目中，这种 '通过代价换取稳定性' 的取舍是必须的。",
+      "code": "/* domain.h */\nint Config_GetThreshold(void);\nvoid Config_SetThreshold(int value);\n\n/* domain.c */\nstatic int s_threshold = 100; // 局部于此模块，禁止外部直接访问\nint Config_GetThreshold(void) { return s_threshold; }\nvoid Config_SetThreshold(int value) { s_threshold = value; }",
+      "pitfalls": ["陷阱1：多处 extern 定义 → 链接错误或数据覆盖 → 使用 static 配合封装接口", "陷阱2：ISR 修改全局变量 → 主循环读取乱码 → 必须加 volatile 或临界区保护", "陷阱3：模块初始化时序导致读取空指针 → 模块使用前置检查 → 增加 init 状态检查"],
+      "refBook": ["《C语言接口与实现》ch2", "《UNIX编程艺术》ch4"]
     },
     {
-      "id": "2026-05-05-dma-snippet",
-      "title": "USART DMA 双缓冲接收代码片段",
-      "topic": "DMA 循环缓冲区",
+      "id": "2026-05-05-snippet",
+      "title": "ADC 采样结果的安全访问接口",
+      "topic": "模块解耦",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": [
-        "STM32",
-        "HAL",
-        "DMA"
-      ],
-      "explanation": "硬件行为是确定的，不确定的是对中断顺序的理解。「简单即是美，简洁的设计能够减少出错的可能性。」——《UNIX编程艺术》",
-      "content": "使用 STM32 HAL 库实现 UART DMA 循环接收，关键在于利用 DMA_TC（传输完成）和 DMA_HT（半传输完成）双中断。在 HT 中处理上半区，TC 中处理下半区，实现零拷贝数据接收。需注意在 NVIC 中配置 USART 和 DMA 通道的中断，且必须在 ISR 中调用 HAL_DMA_IRQHandler，并在回调函数中手动重启下一次传输。",
-      "code": "/* 1. 配置 DMA 传输 */\nHAL_UART_Receive_DMA(&huart1, dma_buffer, BUFFER_SIZE);\n\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    // 2. 传输完成，处理下半区数据\n    process_data(&dma_buffer[BUFFER_SIZE/2], BUFFER_SIZE/2);\n}\n\nvoid HAL_UART_RxHalfCpltCallback(UART_HandleTypeDef *huart) {\n    // 3. 半传输完成，处理上半区数据\n    process_data(&dma_buffer[0], BUFFER_SIZE/2);\n}\n\n// 4. 清除逻辑由 HAL_DMA_IRQHandler 自动处理，\n// 需确保 NVIC_PriorityGroup 优先级配置高于耗时任务。",
-      "pitfalls": [
-        "陷阱1：HAL_DMA_IRQHandler 未清除标志 → 重复触发 → 必须在 ISR 中确认标志位",
-        "陷阱2：Buffer 声明未加 __attribute__((aligned)) → DMA 访问非法内存 → 使用对其内存",
-        "陷阱3：在 Callback 中调用阻塞函数 → 导致 DMA 挂起 → Callback 必须为非阻塞逻辑"
-      ],
-      "refBook": [
-        "《代码大全》Ch13",
-        "STM32 Reference Manual"
-      ]
+      "tags": ["ADC", "数据接口"],
+      "explanation": "为了确保采样值在中断更新时不会导致不一致，应采用封装接口并利用内存原子操作或禁中断访问。这是构建可靠驱动的基石。「任何时候，如果你的程序需要修改共享资源，就必须先获取控制权。」——《代码大全》",
+      "content": "在 STM32 中使用 ADC 的 DMA 模式时，直接读取全局 buffer 极易踩到 DMA 正在搬运数据时的不一致陷阱。以下接口通过原子访问方式保护数据完整性，确保上层应用在任意时刻获取的都是最新且合法的采样值。注意在访问 ADC_DR 时，建议关闭中断以避免读取中间状态，或者检查 DMA 的完成位，但在高频采样时，直接读出寄存器值的副本通常更可靠。",
+      "code": "/* adc_interface.c */\n#include \"stm32f4xx_hal.h\"\n\nstatic volatile uint32_t s_adc_val = 0;\n\nvoid HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {\n    if (hadc->Instance == ADC1) {\n        // 只有在完成中断时才同步一次全局状态\n        s_adc_val = HAL_ADC_GetValue(hadc);\n    }\n}\n\n// 给外部提供的只读接口\nuint32_t ADC_GetLatestValue(void) {\n    uint32_t val;\n    __disable_irq(); // 保护数据一致性，防止中断中途修改\n    val = s_adc_val;\n    __enable_irq();\n    return val;\n}",
+      "pitfalls": ["陷阱1：读取时中断产生 → 获取旧值 → 增加禁中断保护", "陷阱2：忘记检查 DMA 标志 → 误读无效数据 → 必须配合转换完成回调", "陷阱3：ADC 时钟未预热 → 读取 0 值 → 加入 ADC 初始化状态判断"],
+      "refBook": ["《C陷阱与缺陷》ch5"]
     },
     {
-      "id": "2026-05-05-dma-tip",
-      "title": "循环缓冲实现中的常见逻辑陷阱",
-      "topic": "DMA 循环缓冲区",
+      "id": "2026-05-05-tip",
+      "title": "解耦过程中的常见雷区",
+      "topic": "模块解耦",
       "mode": "tip",
       "language": "C",
       "platform": "通用嵌入式",
       "toolchain": "GCC",
       "snippetType": "note",
-      "difficulty": "intermediate",
-      "tags": [
-        "Bug",
-        "DMA",
-        "逻辑"
-      ],
-      "explanation": "代码错误通常隐藏在边界条件下。「程序员必须了解预处理器的工作原理。」——《C陷阱与缺陷》",
-      "content": "在实现循环缓冲区时，最常见的错误是头尾指针的环绕逻辑处理。错误判断指针 `head == tail` 为满，会导致只有 `size-1` 个存储空间。建议使用 `(head + 1) % size == tail` 判断满，或者在存储结构中增加一个计数字段 `count`。此外，DMA 控制器寄存器（如 DMA_CNDTRx）的读取必须在中断中完成，否则由于指令流水线，读到的数据往往是上一轮的值。",
-      "code": "/* 常见的循环溢出错误 */\nif (head == tail) { /* buffer full */ }\n// 修正方法：使用 count 字段\nif (rb->count == rb->size) { /* buffer full */ }",
-      "pitfalls": [
-        "陷阱1：头尾指针重叠判断错误 → 满判断逻辑缺失 → 引入计数字段解决",
-        "陷阱2：未对 DMA 传输寄存器做原子保护 → 主循环读取与中断同时修改 → 对寄存器使用 volatile 关键字",
-        "陷阱3：循环缓冲区长度非 2 的幂次 → 使用取模运算导致性能下降 → 尽量使缓冲区大小为 2^n 以位运算优化"
-      ],
-      "refBook": [
-        "《C陷阱与缺陷》Ch3"
-      ]
+      "difficulty": "beginner",
+      "tags": ["踩坑", "调试"],
+      "explanation": "这些细节往往是导致 '难以追踪的 bug' 的温床，通过强制模块独立和规范访问，可以消灭一半的隐蔽 bug。「在调试阶段花费的时间，总是与在设计阶段节省的时间成比例。」——《代码大全》",
+      "content": "解耦全局变量不仅仅是改改变量声明，更重要的是重新梳理数据流向。在嵌入式开发中，很多习惯做法（比如为了省事直接 extern）在复杂项目中即是毒药。以下是常见且极易导致系统崩溃的场景及其快速修复方案。",
+      "code": "// 演示：防范全局指针空悬\nstatic int *g_ptr = NULL;\nvoid Data_Update(int *new_data) {\n    if (new_data == NULL) return; // 修复：必须检查\n    g_ptr = new_data;\n}",
+      "pitfalls": ["陷阱1：头文件循环包含 → 编译报错 → 使用前向声明(Forward Declaration)或重构依赖树", "陷阱2：静态链接库内全局变量冲突 → 符号污染 → 使用 static 限定可见域", "陷阱3：ISR 内修改非 volatile 变量 → 编译器优化缓存 → 强制添加 volatile 修饰符"],
+      "refBook": ["《C陷阱与缺陷》ch3", "《代码大全》ch10"]
     },
     {
-      "id": "2026-05-05-dma-refactor",
-      "title": "重构：从全局数组操作到封装对象",
-      "topic": "DMA 循环缓冲区",
+      "id": "2026-05-05-refactor",
+      "title": "从脏乱的全局标志位到状态封装",
+      "topic": "模块解耦",
       "mode": "refactor",
       "language": "C",
       "platform": "STM32LL",
       "toolchain": "LL",
       "snippetType": "pattern",
-      "difficulty": "intermediate",
-      "tags": [
-        "重构",
-        "解耦"
-      ],
-      "explanation": "好的重构能让代码自己说话。「任何傻瓜都可以写出计算机能理解的代码，优秀的程序员写出人类能理解的代码。」——《代码大全》",
-      "content": "改进前代码直接操作全局数组 `g_rx_buf` 和 `g_idx`，且逻辑耦合，一旦更换 UART 接口或增加功能就会变成灾难。改进后采用结构体封装，将缓冲区状态私有化，仅暴露接口，增强了模块的安全性与可重用性。",
-      "code": "// 改进前 (坏味道)\nuint8_t g_rx_buf[100];\nint g_idx = 0;\nvoid process() { g_rx_buf[g_idx++] = ... }\n\n// 改进后\nstruct RingBuffer { uint8_t *buf; size_t head; size_t size; };\nsize_t rb_push(struct RingBuffer *rb, uint8_t val) {\n    rb->buf[rb->head] = val;\n    rb->head = (rb->head + 1) % rb->size;\n    return 1;\n}",
-      "pitfalls": [
-        "陷阱1：未封装导致全局污染 → 难以调试多处修改点 → 封装为结构体隐藏细节",
-        "陷阱2：硬编码数组长度 → 灵活性差 → 通过结构体参数传入大小",
-        "陷阱3：函数直接操作寄存器 → 移植性差 → 在接口函数中通过封装底层 LL 寄存器操作"
-      ],
-      "refBook": [
-        "《重构》Ch3"
-      ]
+      "difficulty": "advanced",
+      "tags": ["重构", "状态机"],
+      "explanation": "将全局的 'int status' 变量收拢为状态管理模块，使用枚举类型限制输入范围，这是迈向高质量代码的关键步骤。「代码坏味道的根本在于缺乏清晰的边界定义。」——《重构》",
+      "content": "改进前：到处可见 'if (system_status == 1)'，没人知道 1 代表什么。改进后：封装为 State_Manager 模块，通过 API 使用。这样一旦系统状态逻辑变复杂（例如增加错误恢复状态），无需修改任何业务代码，只需更新内部实现。",
+      "code": "/* 改进后 */\ntypedef enum { SYS_INIT, SYS_READY, SYS_ERROR } SystemState_t;\n\nstatic SystemState_t s_state = SYS_INIT;\n\nSystemState_t Sys_GetState(void) { return s_state; }\nvoid Sys_Transition(SystemState_t new_state) {\n    // 这里可以加状态机跳转校验\n    s_state = new_state;\n}",
+      "pitfalls": ["陷阱1：转换逻辑非法 → 状态机混乱 → 在 Transition 函数中加入逻辑校验", "陷阱2：状态遗漏 → 未知行为 → 使用 default 覆盖 switch 的所有情况", "陷阱3：枚举值重复定义 → 编译器冲突 → 添加前缀如 SYS_"],
+      "refBook": ["《重构》ch3", "《UNIX编程艺术》ch1"]
     }
   ]
 }
