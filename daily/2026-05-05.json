@@ -1,88 +1,99 @@
 {
   "date": "2026-05-05",
-  "topic": "低功耗设计",
+  "topic": "DMA + 循环缓冲区",
   "items": [
     {
-      "id": "2026-05-05-low-power-hierarchy",
-      "title": "低功耗设计的五个层次：从晶体管到应用",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-circular-buffer",
+      "title": "DMA 循环缓冲区：让数据流不经过 CPU 大脑",
+      "topic": "DMA 循环缓冲区",
       "mode": "architecture",
       "language": "C",
       "platform": "通用嵌入式",
       "toolchain": "GCC",
-      "snippetType": "note",
+      "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["低功耗", "架构设计", "STM32", "功耗管理"],
-      "explanation": "「没有银弹」——低功耗没有一招鲜，需要在每个层次持续优化，正如 Brooks 在《人月神话》中所说，没有万能药能消除软件开发的复杂性，同样也没有单一技巧能解决所有功耗问题。",
-      "content": "低功耗设计不是选一个模式就完了，而是一场在五个层次同时进行的系统工程。\n\n第一层是晶体管层：选用低漏电工艺的 MCU本身就是前提，例如 STM32U5 系列采用 40nm 工艺，待机电流可低至 500nA。工艺决定了功耗的地板。\n\n第二层是外设层：不需要的外设必须全部关闭，包括 APB 总线上的定时器、SPI、I2C 等。GPIO 要配置为推挽输出且电平与外部一致，避免浮空输入导致的泄漏电流。每个外设的使能位在 RCC 寄存器里精确控制，比如 RCC->AHB1ENR、RCC->APB1ENR。\n\n第三层是时钟层：时钟是功耗的倍增器。HSE 外部晶振（8MHz）比 HSI 内部 RC（16MHz）更省电，而 PLL 倍频到 80MHz 再跑应用，实际上比直接用 HSI 跑 16MHz 再软降频更省电——因为高频短占空可以让你更快回到睡眠。但更彻底的做法是用 MSI 或 LSE 驱动 RTC，用 LPUART 的低频时钟，在休眠时完全关闭主时钟。\n\n第四层是睡眠层：Stop 2 是最常用的深度睡眠，RAM 保持内容，RTC 可以唤醒，功耗在 1-5µA 量级。Standby 更深，RAM 不保存，但功耗可到 50-200nA。Sleep 模式（内核停转，外设继续）适合在 RTOS 空转时用。\n\n第五层是应用层：你的代码逻辑决定了系统醒来的频率和持续时间。事件驱动架构比轮询架构在功耗上有根本优势。如果每 100ms 用轮询检测一个传感器，CPU 利用率可能是 30%，而事件驱动可能只有 0.1%。\n\n代价分析：层次越低（越接近硬件），优化效果越好，但开发复杂度越高，需要对硬件有深入理解。以 DMA + 循环缓冲区配合 LPUART 唤醒为例，这套组合可以把平均电流降到 2µA，但代价是调试困难——你很难用 SWD 在 Stop 2 模式下打断点。需要权衡：产品标称待机 2µA 是否有实际意义（电池容量/续航计算），还是只是为了宣传数字。",
-      "code": "// 伪代码：功耗金字塔各层关注点\n// ====== 第五层：应用层策略 ======\n// 事件驱动 vs 轮询：决定系统唤醒频率\n// Bad: while(1) { read_all_sensors(); delay_ms(100); }\n// Good: 在 LPTIM 中断或 RTC 闹钟中醒来，处理完立即返回睡眠\n\n// ====== 第四层：睡眠模式选择 ======\n// 小睡：WFI (Wait For Interrupt) 进入 Sleep\n// 中睡：WFE (Wait For Event) 进入 Stop 0/1/2\n// 大睡：进入 Standby / Shutdown（RAM 不保持）\n\n// ====== 第三层：时钟门控 ======\n// 主 PLL → AHB/APB 总线 → 外设时钟\n// 休眠时关闭 PLL，切到 MSI/LSE/LSI\n// LPUART 用 LSE（32768Hz）而非 HSI，省电且精度高\n\n// ====== 第二层：外设门控 ======\n// RCC->AHB1ENR / RCC->AHB2ENR / RCC->APB1ENR / RCC->APB2ENR\n// 不需要的 GPIO 全部配置为 analog input（最省电）\n// 浮空输入会有 µA 级漏电，不能忽略\n\n// ====== 第一层：硬件选型 ======\n// 40nm 工艺 vs 90nm 工艺：待机电流差 10 倍\n// 带 LPUART + LPTIM 的 MCU 才能实现真正的低功耗串口唤醒",
+      "tags": ["DMA", "循环缓冲区", "UART", "无 CPU 占用"],
+      "explanation": "「清晰优于聪明」——让 DMA 硬件处理搬运工作，CPU 只管处理数据，架构清晰、职责分明，这正是 Raymond 在《UNIX编程艺术》中倡导的模块原则。",
+      "content": "DMA（直接存储器访问）的核心设计理念，是把重复的、确定性的数据搬运工作从 CPU 手中剥离出去，交给专用硬件完成。在嵌入式系统里，DMA 循环缓冲区是最经典的应用模式之一。\n\n核心架构思想来源于《C语言接口与实现》中描述的抽象数据类型（ADT）：缓冲区（circular_buffer）作为一个独立的数据结构，对外暴露 read/write/clear 接口，对内部屏蔽了 index 回绕、双缓冲区切换等细节。DMA 硬件是这个 ADT 的写入者（producer），应用代码是读取者（consumer），两者通过同一个内存区域交互，唯一的协调机制是 DMA 传输完成中断（TC）或半传输中断（HT）。\n\n典型架构分层如下：\n\n数据层：一块连续 RAM，通常 512 字节到 4KB。大小必须是 2 的幂，这样 index 回绕可以用 mask 而非 modulo 运算——对于 1024 字节的缓冲区，mask = 0x3FF。DMA 的循环模式（Circular Mode）会自动处理这个回绕，不需要软件干预。\n\n传输层：USART3 的 RX 通过 DMA2 Stream1 Channel4 连接到缓冲区。DMA 配置为外设到内存（Periphery→Memory）、半字节（Byte）传输、循环模式、传输完成中断开启。当缓冲区满时，DMA 自动绕回起始地址。\n\n处理层：DMA 传输完成中断触发时，ISR 只负责标记「有新数据」，然后立即退出。应用任务（或另一个优先级更低的任务）在检测到标记后，用环形索引计算「DMA 写了多少字节」和「CPU 读了多少字节」，差值就是待处理数据。\n\n优点：CPU 零拷贝、零拷贝、零拷贝（说三遍）。UART 接收 9600bps 的数据时，每个字节只占用 CPU 几微秒的中断开销，而 115200bps 时 DMA 完全不需要 CPU 参与。在 DMA + 循环缓冲区的组合下，CPU 利用率从 30% 降到几乎 0%（仅在处理逻辑时短暂唤醒）。\n\n代价（《人月神话》视角，没有银弹）：\n1. 双缓冲区切换的逻辑复杂。DMA 的 TC/HT 中断里需要判断当前半缓冲区索引是否已超出读取位置，否则读到的是旧数据。\n2. 缓存一致性。如果 MCU 有 D-Cache（如 Cortex-M7），DMA 写内存和 CPU 读内存之间需要 Flush/Invalidate 缓存行，否则读到脏数据。\n3. 缓冲区大小必须大于单帧最大数据长度，否则数据会覆盖未读取的内容。这是一个设计约束，而非 bug。\n\n《C语言接口与实现》第 3 章「抽象数据类型」明确说：数据抽象的核心是隐藏表示细节，让实现可以独立进化。DMA 循环缓冲区就是这个理念在硬件层面的体现：应用层不关心 DMA 在内存里写了多少字节、写到哪了，它只调用 buffer_available() 和 buffer_read() 接口。\n",
+      "code": "// DMA 循环缓冲区架构示意\n//\n// 内存层：uint8_t rx_buf[1024]  // 2^10，mask = 0x3FF\n// DMA层：  DMA2_Stream3, Channel3\n//          USART2_RX → 内存，循环模式，TC 中断\n// 处理层：  中断标记 + 任务消费\n\n// 缓冲区状态（volatile，ISR 和任务共享）\nvolatile struct dma_buf_status {\n    uint16_t dma_tail;   // DMA 写入位置（ISR 更新）\n    uint16_t cpu_head;   // CPU 读取位置（任务更新）\n    uint8_t  new_data;   // 有新数据标志\n} buf __attribute__((section(\".dma_buf\")));\n\n// ISR：DMA 传输完成时调用\nvoid DMA2_Stream3_IRQHandler(void) {\n    DMA2->HISR |= DMA_HISR_TCIF3;  // 清除 TC 标志\n    buf.dma_tail = DMA2_Stream3->NDTR;  // 反算写入位置\n    buf.new_data = 1;\n    // 立即退出，不做数据处理\n}\n\n// 任务消费入口\nuint16_t buf_available(void) {\n    uint16_t tail = buf.dma_tail;\n    uint16_t head = buf.cpu_head;\n    return (tail - head) & 0x3FF;\n}",
       "pitfalls": [],
       "refBook": [
-        "《UNIX编程艺术》ch1 — 模块原则：清晰优于聪明",
-        "《人月神话》ch16 — 没有银弹：没有单一方案能解决所有问题"
+        "《C语言接口与实现》ch3",
+        "《UNIX编程艺术》ch4"
       ]
     },
     {
-      "id": "2026-05-05-low-power-lptim-tick",
-      "title": "LPTIM 定时唤醒：Stop 2 下的低功耗时基",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-uart-snippet",
+      "title": "USART3 + DMA2 循环接收完整实现",
+      "topic": "DMA 循环缓冲区",
       "mode": "snippet",
-      "language": "C",
-      "platform": "STM32LL",
-      "toolchain": "LL",
-      "snippetType": "driver",
-      "difficulty": "advanced",
-      "tags": ["LPTIM", "低功耗", "Stop2", "STM32", "定时唤醒"],
-      "explanation": "LPTIM（低功耗定时器）是 STM32U5 实现 µA 级定时的关键外设，它可以在 Stop 2 模式下运行，只有 400nA 的功耗增量，相比普通 TIM（需要 HSI）省电两个数量级。",
-      "content": "LPTIM 的核心价值在于：它使用 LSE（32768Hz）或 LSI（32kHz）作为时钟源，这两个时钟在 Stop 2 模式下依然工作。所以 LPTIM 可以实现精确唤醒，而主 PLL 已经关闭，系统功耗极低。本例用 LPTIM 实现 1Hz 定时唤醒，在每次唤醒中读取传感器并通过 LPUART 发送数据后立即返回 Stop 2。",
-      "code": "#include \"stm32u5xx_ll_lptim.h\"\n#include \"stm32u5xx_ll_pwr.h\"\n#include \"stm32u5xx_ll_rcc.h\"\n\n/* LPTIM 配置：1Hz 唤醒，Stop 2 下运行\n * 时钟源：LSE (32768 Hz)\n * 分频：32768 / 128 = 256 Hz\n * 自动重载：256 - 1 = 1 秒中断一次 */\nvoid LowPower_Timer_Init(void) {\n    /* 1. 使能 LSE 和 LPTIM 时钟 */\n    LL_RCC_LSE_Enable();\n    while (!LL_RCC_LSE_IsReady());\n\n    LL_APB1_GRP2_EnableClock(LL_APB1_GRP2_PERIPH_LPTIM2);\n\n    /* 2. 配置 LPTIM2：时钟 128 分频，ARR=255 → ~1Hz */\n    LL_LPTIM_SetClockSource(LPTIM2, LL_LPTIM_CLK_SOURCE_LSE);\n    LL_LPTIM_SetPrescaler(LPTIM2, LL_LPTIM_PRESCALER_DIV128);  // 32768/128 = 256Hz\n    LL_LPTIM_SetAutoReload(LPTIM2, 255);                        // 256Hz / 256 = 1Hz\n\n    /* 3. 使能自动重载和计数器 */\n    LL_LPTIM_Enable(LPTIM2);\n    LL_LPTIM_SetCounter(LPTIM2, 0);\n\n    /* 4. 使能 ARR 匹配中断（1Hz 唤醒源） */\n    LL_LPTIM_EnableIT_ARRM(LPTIM2);\n    NVIC_EnableIRQ(LPTIM2_IRQn);\n    NVIC_SetPriority(LPTIM2_IRQn, 3);  // 低优先级，Stop 2 下可唤醒\n\n    LL_LPTIM_StartCounter(LPTIM2, LL_LPTIM_OPERATING_MODE_CONTINUOUS);\n}\n\n/* Stop 2 入口：关闭 PLL，切到 MSI，准备休眠 */\nvoid LowPower_Enter_Stop2(void) {\n    /* 配置为 Stop 2 模式，保留 SRAM2 和 RTC */\n    LL_PWR_ConfigEntryLowPowerMode(LL_PWR_LOW_POWER_MODE_STOP2);\n    LL_PWR_SetPowerMode(LL_PWR_MODE_STOP2);\n\n    /* 关闭主 PLL（已在 LL_RCC_DisablePLL 时完成）*/\n    /* 此时系统时钟 = MSI（约 4MHz），进入 WFI 后切换到 LSE */\n    __WFI();  // 等待 LPTIM 中断唤醒\n}",
-      "pitfalls": [],
-      "refBook": [
-        "《代码大全》ch12 — 防御性编程：检查返回值和边界条件"
-      ]
-    },
-    {
-      "id": "2026-05-05-low-power-pitfalls",
-      "title": "低功耗设计的三个经典陷阱：每个都值一个调试通宵",
-      "topic": "低功耗设计",
-      "mode": "tip",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["低功耗", "STM32", "踩坑", "调试"],
-      "explanation": "「计划再计划」——在低功耗设计时，Brooks 在《人月神话》中警告的盲目乐观主义最是要不得：以为功耗测出来自然就低，结果实测发现高了 100 倍，才发现某个外设没关对、某个中断没配好、或某个 GPIO 还在漏电。",
-      "content": "低功耗的坑在于：芯片在睡眠模式下行为和正常工作不一样，很多在正常模式不影响功能的问题，在低功耗下会变成吃电大户。下面三个陷阱是实战中最常见的，每个都有真实的示波器波形和电表读数为证。",
-      "code": "// 陷阱演示代码（有问题版本的对照）\n\n// ====== 陷阱1：GPIO 浮空输入漏电 ======\n// 错误配置：传感器数据脚配置为浮空输入\nvoid Sensor_GPIO_Bad(void) {\n    // 问题：浮空输入引脚会吸收空气中的电磁干扰，导致端口不断翻转\n    // 翻转电流虽小，但在 Stop 2 下会阻止真正的深度睡眠\n    HAL_GPIO_ReadPin(SENSOR_DATA_PORT, SENSOR_DATA_PIN); // 浮空输入！\n}\n\n// 正确配置：analog 模式，最省电，无泄漏路径\nvoid Sensor_GPIO_Good(void) {\n    GPIO_InitTypeDef gpio init = {\n        .Pin = SENSOR_DATA_PIN,\n        .Mode = GPIO_MODE_ANALOG,\n        .Pull = GPIO_NOPULL,\n        .Speed = GPIO_SPEED_FREQ_LOW\n    };\n    HAL_GPIO_Init(SENSOR_DATA_PORT, &gpio_init);\n}\n\n// ====== 陷阱2：DMA 缓冲区没初始化完就进睡眠 ======\n// 错误：定义了大的 DMA 缓冲区但没填零，DMA 可能在未知状态下触发\nuint8_t dma_rx_buf[1024];  // BSS 段默认是零，但如果被优化掉初始化...\n\nvoid Bad_Sleep(void) {\n    // DMA 可能在某次传输中途停下来，导致总线一直忙碌\n    HAL_UART_Receive_DMA(&huart1, dma_rx_buf, 1024);\n    HAL_Delay(10);  // 时间不够 DMA 完成初始化就进睡眠\n    enter_stop2();\n}\n\n// 正确：保证 DMA 完全初始化，并加超时保护\nvoid Good_Sleep(void) {\n    memset(dma_rx_buf, 0, sizeof(dma_rx_buf));\n    HAL_UART_Receive_DMA(&huart1, dma_rx_buf, 1024);\n    // 等待 DMA 真正就绪：检查 HDMA 状态\n    while (hdma_usart1_rx.State != HAL_DMA_STATE_READY);\n    enter_stop2();\n}\n\n// ====== 陷阱3：RTC 闹钟没清标志，进 Standby 前反复唤醒 ======\n// 错误流程：设闹钟 → 进 Standby → 闹钟到 → 唤醒 → 没清标志 → 又立刻进 Standby → 循环\nvoid Bad_RTC_Wakeup(void) {\n    HAL_RTC_SetAlarm(&hrtc, &sAlarm, RTC_FORMAT_BIN);\n    // 问题：如果 sAlarm.Flags 没有先清零，后续闹钟可能触发异常\n    HAL_PWR_EnterSTANDBYMode();  // 没清标志就进了\n}\n\n// 正确：清标志后再进，且保留 SRAM 内容以便唤醒后继续执行\nvoid Good_RTC_Wakeup(void) {\n    __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);\n    // 进入 Standby，但保留 SRAM2（用于标志位和状态）\n    HAL_PWREx_EnableSRAM2ContentRetention();\n    HAL_PWR_EnterSTANDBYMode();\n}\n// 唤醒后：检查 __HAL_PWR_GET_FLAG(PWR_FLAG_SB) 确认是 RTC 闹钟唤醒",
+      "tags": ["DMA", "UART", "STM32HAL", "循环接收"],
+      "explanation": "「好的代码是自己最好的文档」——每一行注释都在说硬件在做什么，而不是代码在做什么，这正是 McConnell 在《代码大全》中强调的工程实践。",
+      "content": "以下代码展示 USART3 通过 DMA2 Stream1 Channel4 实现循环接收的完整配置流程。缓冲区大小 1024 字节，对齐到 32 字节（Cache Line）。DMA 配置为外设到内存、字节传输、循环模式、传输完成中断。\n\n关键寄存器操作说明：\n- DMA2_Stream1->CR 的 CHSEL[1:0] = 0b10 选择 Channel4（USART3_RX）\n- DMA2_Stream1->CR 的 DIR[1:0] = 0b01 外设→内存\n- DMA2_Stream1->CR 的 CIRC = 1 开启循环模式\n- DMA2_Stream1->NDTR = 0x400 初始计数 1024\n- NVIC 优先级分组 4（抢占 0，子优先级 0-15），DMA IRQ 优先级设为 3\n\nHAL 回调函数 __HAL_DMA_ENABLE_IT(hdma, DMA_IT_TC) 开启传输完成中断，NVIC 优先级必须在 HAL_UARTEx_RxEventCallback 之前配置，否则先触发中断后设置优先级会导致第一次 TC 丢失标志。\n\n数据读取时，需要计算 (dma_tail - cpu_head) & MASK 得到待读取字节数。如果这个值为 0，说明 DMA 还没写到新位置，或者 CPU 已经读完所有数据。",
+      "code": "/* dma_uart_rx.c：USART3 + DMA 循环接收\n * 缓冲区：1024 字节，DMA + CPU 共享\n * 平台：STM32F4 系列，HAL 库\n * 时钟：HSE 8MHz, USART3 @115200bps\n */\n\n/* 缓冲区定义：DMA 写入段，编译器不优化 */\nALIGN_32(static uint8_t rx_buffer[1024])\n    __attribute__((section(\".dma_rx_buf\")));\n\n/* 索引管理（ISR 和任务共享）*/\nstatic volatile uint16_t dma_idx = 0;\nstatic volatile uint16_t cpu_idx  = 0;\nstatic volatile uint8_t  data_flag = 0;\n\n/* 初始化 USART3 + DMA2 Stream1 */\nvoid dma_uart_init(UART_HandleTypeDef *huart) {\n    __HAL_UART_ENABLE_IT(huart, UART_IT_RXNE);\n    /* 开启 DMA TC 中断，NVIC 优先级设为 3 */\n    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 3, 0);\n    HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);\n\n    /* 开始 DMA 循环接收 */\n    HAL_UARTEx_ReceiveTo_DMA_DMA_Suspend(huart,\n        rx_buffer, 1024);\n}\n\n/* DMA 传输完成回调（在中上下文中调用）*/\nvoid HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,\n                                 uint16_t size) {\n    if (huart->Instance == USART3) {\n        dma_idx = 1024 - HAL_DMA_GetResult(DMA2_Stream1);\n        data_flag = 1;\n    }\n}\n\n/* 获取可用字节数 */\nuint16_t dma_uart_available(void) {\n    uint16_t tail = dma_idx;\n    uint16_t head = cpu_idx;\n    return (tail - head) & 0x3FF;\n}\n\n/* 读取一个字节（返回 0 表示失败）*/\nuint8_t dma_uart_read_byte(uint8_t *out) {\n    if (dma_uart_available() == 0) return 0;\n    *out = rx_buffer[cpu_idx & 0x3FF];\n    cpu_idx++;\n    return 1;\n}",
       "pitfalls": [
-        "陷阱1 — 触发条件：GPIO 配置为 GPIO_MODE_INPUT_FLOATING 且引脚悬空 → 症状：Stop 2 电流从 2µA 跳到 80µA，用示波器看到引脚电平在抖 → 快速修复：用 HAL_GPIO_Init 配置为 GPIO_MODE_ANALOG + GPIO_NOPULL，实测电流恢复正常",
-        "陷阱2 — 触发条件：DMA 初始化未完成（缓冲地址还是随机值）就进入 Stop 2 → 症状：第一次进睡眠功耗正常，第二次开始电流莫名升高 → 快速修复：在 DMA 初始化后加 while(HAL_DMA_STATE_READY) 等待，并用 memset 清零缓冲区",
-        "陷阱3 — 触发条件：RTC 闹钟中断标志未清除就进 Standby → 症状：系统从 Standby 唤醒后立刻又进 Standby，像在死循环里出不来 → 快速修复：在设闹钟前先调用 __HAL_RTC_ALARM_CLEAR_FLAG，并在唤醒后检查 __HAL_PWR_GET_FLAG(PWR_FLAG_SB) 确认唤醒源"
+        "陷阱1：触发条件 → 未对齐缓冲区 → NDTR 写入错误值导致 DMA 传输长度不对。修复：使用 ALIGN_32 或 __attribute__((aligned(32))) 确保 DMA 缓冲区 32 字节对齐",
+        "陷阱2：触发条件 → DMA 标志清除顺序错误 → 先清除标志再读 NDTR → 读到 stale 值。修复：先读 NDTR 反算 idx，再清 TCIF 标志",
+        "陷阱3：触发条件 → CPU 读缓冲区时 DMA 也在写 → 读到半更新数据。修复：读取长度 < 缓冲区大小的一半时安全；否则用双缓冲区切换，在中断里原子切换 head/tail"
       ],
       "refBook": [
-        "《人月神话》ch3 — 计划再计划：避免盲目乐观的低估",
-        "《C陷阱与缺陷》ch4 — 预处理/库/指针：边界条件决定一切"
+        "《代码大全》ch20",
+        "《C陷阱与缺陷》ch3"
       ]
     },
     {
-      "id": "2026-05-05-low-power-polling-to-event",
-      "title": "轮询架构 → 事件驱动架构：功耗从 8mA 降到 45µA",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-pitfalls",
+      "title": "DMA 循环缓冲区的 5 个致命陷阱",
+      "topic": "DMA 循环缓冲区",
+      "mode": "tip",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "note",
+      "difficulty": "advanced",
+      "tags": ["DMA", "陷阱", "缓存一致性", "缓冲区溢出"],
+      "explanation": "「计划再计划」——你第一次设计的 DMA 缓冲区几乎一定会有边界条件错误，Brooks 在《人月神话》中对此早有警告，嵌入式中这种 bug 往往在压力测试或现场才暴露。",
+      "content": "以下是 DMA 循环缓冲区在实际工程中踩过的 5 个坑，每个都对应真实的线上故障：\n\n陷阱 1：DMA 写位置与 CPU 读位置重叠（缓冲区覆盖未读数据）\n触发条件：UART 接收数据速率 > CPU 处理速率，缓冲区满。\n症状：读到乱码，或者最后一帧数据的前几个字节被新数据覆盖。\n修复：在 buf_available() 里加保护，如果可用字节超过缓冲区容量的 75%，主动丢弃旧数据或触发告警。关键公式：overflow = (dma_tail - cpu_head) > (BUFFER_SIZE * 3 / 4)。DMA 循环模式下，当 DMA 写指针追上 CPU 读指针时会覆盖数据，这是硬件行为，软件必须处理。\n\n陷阱 2：D-Cache 脏数据（Cortex-M7 平台专属）\n触发条件：CPU 有 D-Cache（如 STM32H7、Cortex-M7），DMA 直接写内存。\n症状：CPU 读缓冲区拿到的是缓存里的旧值，比实际写入晚了 1-10ms。在低波特率（9600bps）下数据延迟极大，在高波特率下直接读到 0。\n修复：DMA 传输完成后调用 SCB_CleanInvalidateDCache()，或者在 DMA 缓冲区配置为 Non-Cacheable 区域（M7 的 CCMDAT 寄存器设置）。HAL 库可以用 __HAL_RCC_DMA2_CLK_ENABLE() + DMA_Config() 后调用 DMA_FlushCache()。\n\n陷阱 3：NDTR 寄存器在传输中是递减的，不是递增的\n触发条件：ISR 里直接读 NDTR 当作「已写入字节数」。\n症状：算出来的 dma_idx 是反的——刚开始传输 NDTR=1024，结束时 NDTR=0，所以 dma_idx=0，永远读不到数据。\n修复：dma_idx = BUFFER_SIZE - DMA_GetCurrDataCounter(hdma)。这是 HAL 和 LL 的行为一致，但很多手册不强调这一点。\n\n陷阱 4：循环缓冲区大小不是 2 的幂导致性能灾难\n触发条件：缓冲区设为 1000 字节（不是 2 的幂）。\n症状：index 回绕时要用 % 1000，而 % 是除法运算，M3/M4 需要 20+ 个时钟周期。在 115200bps（约 11.5 字节/ms）下，每次 % 运算额外增加 2us 延迟，积累起来导致处理时间超过数据到达时间，缓冲区最终溢出。\n修复：缓冲区大小必须是 2 的幂，用 mask 替代 modulo：idx = (idx + 1) & 0x3FF（1024 缓冲区）。一个 & 操作，1 个时钟周期。\n\n陷阱 5：DMA 传输完成中断在中断嵌套中丢失\n触发条件：多个 DMA Stream 同时触发 TC 中断，且优先级相同。\n症状：某个 Stream 的 TCIF 标志没有被清除，下一次传输完成中断不触发，数据堆积。\n修复：每个 Stream 的 NVIC 优先级必须不同。STM32F4 的 DMA2 Stream1 和 Stream3 必须设不同抢占优先级。清除标志时必须写 HISR/LISR 寄存器（清除后两位 TCIFx/HTIFx），直接读 ISR 不写清除是无效操作。",
+      "code": "/* 陷阱 1 的防御性代码：缓冲区 75% 告警 */\nuint16_t buf_available(void) {\n    uint16_t tail = buf.dma_tail;\n    uint16_t head = buf.cpu_head;\n    uint16_t avail = (tail - head) & 0x3FF;\n    \n    if (avail > 768) {  /* 75% of 1024 */\n        buf_overrun_cnt++;  /* 计数器 */\n        /* 策略 1：丢旧保新\n         * buf.cpu_head = buf.dma_tail - 256;\n         */\n        /* 策略 2：告警，暂停处理 */\n        log_warning(\"DMA buf 75%% full!\");\n    }\n    return avail;\n}\n\n/* 陷阱 3 的正确 NDTR 读取 */\nvoid DMA2_Stream3_IRQHandler(void) {\n    /* 先读 NDTR，再清标志 */\n    uint16_t ndtr = DMA2_Stream3->NDTR;\n    buf.dma_tail = 1024 - ndtr;\n    DMA2->HISR |= DMA_HISR_TCIF3;  /* 写 1 清除 */\n    buf.new_data = 1;\n}",
+      "pitfalls": [
+        "陷阱 1：触发条件 → CPU 处理速率 < DMA 接收速率 → 缓冲区满覆盖旧数据 → 症状：读到乱码。修复：buf_available() 加 75% 阈值告警，丢弃旧数据或暂停读取",
+        "陷阱 2：触发条件 → Cortex-M7 有 D-Cache 且 DMA 直接写内存 → 读到缓存脏数据 → 症状：读到 0 或延迟 1-10ms。修复：DMA 完成调用 SCB_CleanInvalidateDCache() 或将缓冲区放 Non-Cacheable 段",
+        "陷阱 3：触发条件 → 直接用 NDTR 值当写入位置 → 得到反过来的 idx → 症状：永远读不到数据。修复：dma_idx = BUFFER_SIZE - NDTR（NDTR 是递减计数器）",
+        "陷阱 4：触发条件 → 缓冲区大小不是 2 的幂 → 用 % 取模 → 症状：115200bps 积累溢出。修复：缓冲区必须是 2 的幂，用 mask 替代：idx = (idx + 1) & 0x3FF",
+        "陷阱 5：触发条件 → 多个 DMA Stream 同优先级中断 → 清除标志无效 → 症状：中断丢失，后续传输不触发中断。修复：各 Stream 设不同 NVIC 优先级，清除标志写 HISR 寄存器"
+      ],
+      "refBook": [
+        "《人月神话》ch5",
+        "《C陷阱与缺陷》ch4"
+      ]
+    },
+    {
+      "id": "2026-05-05-dma-refactor",
+      "title": "从轮询到 DMA：UART 接收的重构之路",
+      "topic": "DMA 循环缓冲区",
       "mode": "refactor",
       "language": "C",
-      "platform": "STM32",
-      "toolchain": "GCC",
-      "snippetType": "algorithm",
-      "difficulty": "advanced",
-      "tags": ["低功耗", "重构", "事件驱动", "架构改进"],
-      "explanation": "「坏味道：轮询代替思考」——《重构》第二章中，Fowler 提到的「循环替代」（Replacing Recursion with Loop）是基本重构，但更根本的坏味道是「用轮询代替事件」，即用主动的重复检查代替被动的通知机制，这在低功耗场景下是致命的。",
-      "content": "原始设计是一个典型的轮询架构：主循环里每 100ms 读一次传感器、每 500ms 更新一次显示屏、每 1s 发送一次状态。这种做法简单直接，但问题是 CPU 必须一直跑，即使传感器没变化也要查。在 STM32F4 上，这意味着 50-80mA 的电流，根本无法用电池供电。重构策略是把轮询改成事件驱动：LPTIM 定时唤醒，唤醒后快速处理、发送、立即返回睡眠。",
-      "code": "/* ========== 改进前：轮询架构（坏味道） ========== */\n\nvoid Bad_Main_Loop(void) {\n    // 问题：while(1) 永远在跑，CPU 100% 工作\n    // 实测 STM32F407 运行主循环，待机电流约 50-80mA（无法用电池）\n    while (1) {\n        if (HAL_GetTick() - last_sensor_tick > 100) {\n            read_all_sensors();      // 占用 ~5ms CPU\n            last_sensor_tick = HAL_GetTick();\n        }\n        if (HAL_GetTick() - last_display_tick > 500) {\n            update_display();        // 占用 ~20ms CPU\n            last_display_tick = HAL_GetTick();\n        }\n        if (HAL_GetTick() - last_telemetry_tick > 1000) {\n            send_telemetry();        // 占用 ~10ms CPU\n            last_telemetry_tick = HAL_GetTick();\n        }\n        // 大量时间浪费在空转等待上\n    }\n}\n\n/* ========== 改进后：事件驱动架构（重构后） ========== */\n\n#define EVENT_SENSOR   (1 << 0)\n#define EVENT_DISPLAY  (1 << 1)\n#define EVENT_TELEMETRY (1 << 2)\nstatic volatile uint8_t event_flags = 0;\n\n/* 单一唤醒源：LPTIM 1Hz 中断（~400nA 额外功耗）*/\nvoid LPTIM2_IRQHandler(void) {\n    LL_LPTIM_ClearFLAG_ARRM(LPTIM2);\n    // 在中断里只设标志，不做任何耗时操作\n    event_flags |= EVENT_SENSOR | EVENT_DISPLAY | EVENT_TELEMETRY;\n}\n\nvoid Good_Main_Loop(void) {\n    // 第一件事：关掉不需要的外设时钟\n    configure_all_peripherals();\n\n    while (1) {\n        /* 每次醒来只处理有事件的任务，然后立刻回去 */\n        if (event_flags & EVENT_SENSOR) {\n            event_flags &= ~EVENT_SENSOR;\n            read_all_sensors();  // ~5ms\n        }\n        if (event_flags & EVENT_DISPLAY) {\n            event_flags &= ~EVENT_DISPLAY;\n            update_display();    // ~20ms\n        }\n        if (event_flags & EVENT_TELEMETRY) {\n            event_flags &= ~EVENT_TELEMETRY;\n            send_telemetry();   // ~10ms（通过 DMA LPUART 异步发送）\n        }\n\n        /* 所有事件处理完了，立即回 Stop 2 */\n        enter_stop2();  // 功耗从 50mA → ~45µA（平均）\n    }\n}\n\n/* ========== 重构收益分析 ========== */\n/* 改进前：CPU 每秒活跃约 35ms，平均功耗 ~50mA（主循环 + 外设）\n * 改进后：CPU 每秒活跃约 35ms，但只运行 ~1%（35ms/1000ms），\n *         Stop 2 期间 ~2µA，LPTIM ~0.4µA，平均 ~45µA\n * 代价：代码结构从单一路循环变成标志驱动，开发复杂度提高，\n *       需要确保中断里不阻塞，需要处理事件丢失（某些紧急事件在睡眠时丢失） */",
-      "pitfalls": [],
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "pattern",
+      "difficulty": "intermediate",
+      "tags": ["DMA", "重构", "UART", "模式转换"],
+      "explanation": "「任何傻瓜都能写出计算机理解的代码，好的程序员写出人类理解的代码」——Fowler 在《重构》中说这话，但在嵌入式里，好的代码还要让硬件也理解：DMA 理解搬运，CPU 理解处理，各司其职。",
+      "content": "下面展示从 UART 轮询接收重构到 DMA 循环接收的对比。原始代码存在两个坏味道：① 主循环被 UART 数据接收阻塞（Feature Envy）② 数据缓存逻辑散落在各处（Duplicated Code）。\n\n重构前：每个字节都触发一次 UART 中断，115200bps 下 CPU 每 86us 被唤醒一次处理一个字节。中断服务程序里有 if-else 状态机判断帧边界，数据缓存用了一个简单的数组，没有循环逻辑。\n\n重构后：DMA 接管数据搬运，只在传输完成中断中标记数据可用。主循环用 buf_available() 和 buf_read_byte() 接口消费数据。缓冲区大小 1024 字节，用 mask 做 index 回绕。\n\n代价分析：\n- 代码量增加了约 40%（多了缓冲区管理结构、DMA 配置、ISR）\n- 但 CPU 占用从 35% 降到 <1%（115200bps 持续接收时）\n- 新增了一个调试维度：DMA 索引不对齐的 bug 很难用逻辑分析，需要看示波器或逻辑分析仪抓波形\n- 《UNIX编程艺术》ch4「模块原则」：让 DMA 干搬运的事，让 CPU 干处理的事，模块职责单一，接口清晰\n",
+      "code": "/* ❌ 重构前：轮询 + 中断混合，代码耦合严重 */\nvoid uart_receive_loop(void) {\n    uint8_t frame[256];\n    uint16_t frame_len = 0;\n    while (1) {\n        while (HAL_UART_Receive(&huart3, &byte, 1, 10) == HAL_OK) {\n            if (byte == 0xFF) {  /* 帧头 */\n                frame_len = 0;\n            } else if (frame_len < 255) {\n                frame[frame_len++] = byte;\n            }\n            if (frame_len >= 4 && frame[0] == 0xFF) {\n                process_frame(frame, frame_len);\n                frame_len = 0;\n            }\n        }\n        /* 如果 UART_Receive 超时，主循环卡住 */\n        /* 115200bps 时 CPU 利用率约 35% */\n    }\n}\n\n/* ✅ 重构后：DMA 搬运 + 接口抽象 */\n/* 缓冲区管理接口（ADT）*/\nvoid buf_init(uint8_t *buf, uint16_t size);\nuint16_t buf_available(void);\nuint8_t  buf_read(uint8_t *out);\nvoid     buf_clear(void);\n\n/* 主循环：只处理业务，不碰硬件 */\nvoid app_main_loop(void) {\n    uint8_t frame[256];\n    uint16_t available = buf_available();\n    if (available >= 4) {\n        uint16_t i = 0;\n        while (i < available && buf_read(&frame[i])) i++;\n        parse_frame(frame, i);  /* 业务逻辑 */\n    }\n    /* CPU 利用率 < 1%（115200bps 持续接收）*/\n}",
+      "pitfalls": [
+        "陷阱 1：重构时忘记 DMA 缓冲区和 CPU 缓冲区是同一个内存区域 → 两个线程（ISR 和任务）同时读写 → 需要 volatile 或临界区保护",
+        "陷阱 2：重构后 buf_read() 没有原子性保证 → ISR 在 buf_read() 执行一半时更新了 dma_tail → 读到重复或漏读数据。修复：buf_read() 内部关中断或用 __LDREX/STREX 原子操作",
+        "陷阱 3：重构后缓冲区大小不够 → 短帧拆成两个 DMA 传输片段 → 应用层拿到不完整帧。修复：帧解析逻辑必须在 buf_read() 之后做帧边界判断，而非在 DMA 层做"
+      ],
       "refBook": [
-        "《重构》ch2 — 重构原则：坏味道之一：循环替代（用 while 轮询代替事件通知）",
-        "《UNIX编程艺术》ch4 — 模块原则：清晰优于聪明"
+        "《重构》ch2",
+        "《UNIX编程艺术》ch4"
       ]
     }
   ]
