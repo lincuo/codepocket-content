@@ -1,0 +1,86 @@
+{
+  "date": "2026-06-04",
+  "topic": "嵌入式C模块解耦与全局变量之恶",
+  "items": [
+    {
+      "id": "2026-06-04-module-decoupling",
+      "title": "架构：用抽象句柄替代全局变量",
+      "topic": "嵌入式C模块解耦与全局变量之恶",
+      "mode": "architecture",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "note",
+      "difficulty": "intermediate",
+      "tags": ["模块解耦", "信息隐藏", "全局变量", "句柄模式"],
+      "explanation": "《C语言接口与实现》第2章提出：模块的稳定性不取决于代码量，而取决于它依赖的接口数量。全局变量是接口的一种，但它是最粗糙的一种——任何函数都能读取、任何函数都能写入，模块间形成网状耦合。把状态封装在句柄后面，通过 init/ctl/query 三件套暴露操作，模块就变成了有明确边界的对象。正如 Schmidt 所言「接口是契约，实现是自由」，当你用句柄替代全局变量时，你给未来的自己留下了重构实现的空间。",
+      "content": "在嵌入式项目中，全局变量是最常见的耦合源头。想象一个传感器模块：通常的做法是在 sensor.h 里暴露 extern sensor_data_t g_sensor_data;，任何任务都能直接读取。问题出在哪？第一，读取时机不确定——你拿到的是稳定状态还是更新中间态？第二，模块内部改了数据结构，所有 extern 引用处都要改。第三，无法添加读取前的数据校验。\n\n正确的做法是定义 opaque handle：typedef struct sensor_handle sensor_handle_t; 初始化时返回指针，所有访问通过 sensor_read(handle, &temp, &humidity) 完成。模块内部可以用全局变量，但对外完全隐藏。STM32 HAL 库的 GPIO 就是典型——你通过 GPIO_Init() 配置，通过 HAL_GPIO_ReadPin() 读取，永远不会直接操作 IDR 寄存器。\n\n具体实施分三步：第一步，把 extern 变量移入 .c 文件的 static 区域；第二步，为每个变量编写 getter/setter，setter 加校验逻辑；第三步，在 .h 中声明 struct handle 但不定义其成员（opaque pattern），链接时通过指针传递。编译时加入 -Werror=strict-prototypes 检查确保接口声明完整。\n\n代价？函数调用开销。但在 Cortex-M 上，带内联的 getter/setter 基本被编译器优化掉。2026年的 MCU 跑几个寄存器push/pop的开销，远不如一个隐藏的 bug 带来的调试成本。",
+      "code": "// sensor_module.h — 对外的抽象接口\n#ifndef SENSOR_MODULE_H\n#define SENSOR_MODULE_H\n\ntypedef struct sensor_handle sensor_handle_t;\n\ntypedef struct {\n    float temperature;   // °C\n    float humidity;      // %RH\n    uint32_t timestamp;  // ms since boot\n} sensor_reading_t;\n\n// 初始化：内部用全局 I2C 实例，对外不暴露\nsensor_handle_t* sensor_init(uint8_t i2c_addr);\n\n// 读取：原子性获取一组相关读数\nint sensor_read(sensor_handle_t* h, sensor_reading_t* out);\n\n// 销毁\nvoid sensor_destroy(sensor_handle_t* h);\n\n#endif",
+      "pitfalls": [],
+      "refBook": ["《C语言接口与实现》ch2", "《UNIX编程艺术》ch4"]
+    },
+    {
+      "id": "2026-06-04-handle-pattern",
+      "title": "代码：HAL风格句柄模式在 STM32 上的实现",
+      "topic": "嵌入式C模块解耦与全局变量之恶",
+      "mode": "snippet",
+      "language": "C",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "pattern",
+      "difficulty": "intermediate",
+      "tags": ["句柄模式", "opaque指针", "HAL风格", "C语言"],
+      "explanation": "STM32 HAL 库的 GPIO、SPI、UART 驱动全部采用句柄模式，其核心是把寄存器映射、配置状态和运行时状态打包进一个结构体，通过指针传递。这不仅仅是封装风格，更是一种可移植策略——把硬件相关的东西全部锁在句柄内部，算法层只操作 void*。《C语言接口与实现》第3章称之为「抽象数据类型在嵌入式中的直接应用」，它让 C 获得了类似 OOP 的封装能力而零运行时开销。",
+      "content": "以 I2C 传感器模块为例，展示完整的句柄实现。核心设计：.c 文件内定义含私有状态的完整结构体，.h 中只声明 struct tag（不展开成员），初始化时分配句柄指针并返回，后续操作通过句柄间接访问。注意 HAL 风格的返回值约定：0 成功，负数错误码。所有 getter 都通过指针参数返回数据而非直接返回值——这是 C 语言处理多值返回的标准做法，也允许 NULL 检查。\n\n代码在 GCC ARM 工具链下编译通过，函数指针表的引入是点睛之笔——它让同一套算法代码可以操作不同 I2C 地址或不同型号传感器的实例，这正是全局变量版本做不到的。",
+      "code": "// sensor_module.c — 模块内部实现（对用户不可见）\n#include \"sensor_module.h\"\n#include <string.h>\n\n// 完整结构体：只在 .c 文件中定义\nstruct sensor_handle {\n    uint8_t i2c_addr;          // 设备地址\n    I2C_HandleTypeDef* hi2c;   // HAL I2C 句柄\n    uint32_t last_read_tick;   // 上次读取时间戳\n    sensor_reading_t cached;   // 缓存的读数\n    uint8_t init_flag;         // 初始化标记\n};\n\n// 内部：读取单个寄存器\nstatic int16_t read_register(sensor_handle_t* h, uint8_t reg) {\n    uint8_t buf[2];\n    if (HAL_I2C_Mem_Read(h->hi2c, h->i2c_addr, reg, 1, buf, 2, 100)\n        != HAL_OK) {\n        return -1;\n    }\n    return (int16_t)((buf[0] << 8) | buf[1]);\n}\n\nsensor_handle_t* sensor_init(uint8_t i2c_addr) {\n    sensor_handle_t* h = calloc(1, sizeof(*h));\n    if (!h) return NULL;\n    h->i2c_addr = i2c_addr;\n    h->init_flag = 1;\n    return h;\n}\n\nint sensor_read(sensor_handle_t* h, sensor_reading_t* out) {\n    if (!h || !out || !h->init_flag) return -1;\n\n    int16_t raw_temp = read_register(h, 0x07);  // TEMP_OUT\n    int16_t raw_humi = read_register(h, 0x08);  // HUMIDITY_OUT\n    if (raw_temp < 0 || raw_humi < 0) return -1;\n\n    // 转换：假设传感器精度为 0.01\n    out->temperature = raw_temp / 100.0f;\n    out->humidity = raw_humi / 100.0f;\n    out->timestamp = xTaskGetTickCount();\n\n    h->cached = *out;\n    h->last_read_tick = out->timestamp;\n    return 0;\n}",
+      "pitfalls": [
+        "忘记在.h中只声明struct tag而不展开成员——用户就能在栈上分配导致sizeof不对",
+        "free()放在模块外部而非提供destroy函数——模块无法在销毁时释放内部资源（如HAL_I2C_DeInit）",
+        "getter直接返回结构体而非通过指针——包含 float/uint32_t 的结构体拷贝开销大且丢失修改检测能力"
+      ],
+      "refBook": ["《C语言接口与实现》ch3", "《代码大全》ch8"]
+    },
+    {
+      "id": "2026-06-04-global-traps",
+      "title": "避坑：全局变量的三个隐形陷阱",
+      "topic": "嵌入式C模块解耦与全局变量之恶",
+      "mode": "tip",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "note",
+      "difficulty": "beginner",
+      "tags": ["全局变量", "竞态条件", "可测试性", "命名空间污染"],
+      "explanation": "《C陷阱与缺陷》第7章专门讨论了全局变量的可重入性问题——在嵌入式实时系统中，这个问题被无限放大。一个全局变量被两个中断共用，或者被任务 A 修改后被任务 B 读取到半更新状态，这类 bug 无法在单元测试中复现，只会在线上以偶发形式出现。Brooks 在《人月神话》中也指出：「增加人力的最快方式是增加通信」——全局变量让模块间建立了隐式通信通道，而这些通道从不记录在文档中，也从不接受 code review。",
+      "content": "全局变量在嵌入式 C 中的三个最致命的陷阱：\n\n陷阱一：隐式竞态条件。当 g_motor_speed 被 ISR 中的编码器回调和 main 循环中的 PID 任务同时读写，且没有 volatile 修饰或临界区保护时，读取可能得到中间值（例如高 16 位已更新、低 16 位未更新）。症状：电机在某温度下突然抖动，冷却后正常——这是典型的硬件时序导致的竞态。\n\n陷阱二：命名空间污染。全局变量必须全局唯一，项目超过 5 万行后，你不敢用 motor_speed 这个名字，因为不知道别处是否已占用。最终结果是 motor_speed_val_final_v2 这种命名。解决方案是把变量纳入模块句柄，名称变成 h->motor.speed，命名空间自然隔离。\n\n陷阱三：无法模拟的依赖。测试需要 stub 时，全局变量没有入口可以 hook。你要么用宏替换（预处理魔术），要么用弱符号（链接器魔术），要么干脆放弃测试。句柄模式把依赖变成函数参数，stub 只需要实现相同的函数签名。\n\n预防措施：在 CMake 中添加 -Werror=global-variables 警告（需自定义规则），或让 lint 工具（如 cppcheck --enable=globalVariable）在 CI 中扫描。",
+      "code": "// ❌ 反面教材：全局变量版本\n// motor.c\nglobal float g_motor_speed;  // 任何文件都能读写\n\n// encoder.c  — ISR\nvoid HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* h) {\n    if (h->Instance == TIM2) {\n        g_motor_speed = read_encoder();  // 无保护！\n    }\n}\n\n// pid.c  — 任务\nvoid PID_Task(void const* argument) {\n    for (;;) {\n        float error = SETPOINT - g_motor_speed;  // 可能读到中间态\n        float output = pid_update(&pid_ctx, error);\n        set_pwm(output);\n        osDelay(10);\n    }\n}\n\n// ✅ 正确做法：通过句柄 + 临界区\nstatic float g_motor_speed;  // static：仅限本文件\n\nvoid HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* h) {\n    if (h->Instance == TIM2) {\n        uint32_t ms = OS_GetTickCount();\n        portENTER_CRITICAL();\n        g_motor_speed = read_encoder();\n        g_last_update_ms = ms;\n        portEXIT_CRITICAL();\n    }\n}\n\nvoid PID_Task(void const* argument) {\n    for (;;) {\n        float speed;\n        portENTER_CRITICAL();\n        speed = g_motor_speed;\n        portEXIT_CRITICAL();\n        float output = pid_update(&pid_ctx, SETPOINT - speed);\n        set_pwm(output);\n        osDelay(10);\n    }\n}",
+      "pitfalls": [
+        "在ISR读写全局变量时忘记加volatile——编译器优化后根本读不到更新值",
+        "加了volatile但没加临界区——读到的是更新的值但可能是半更新的中间态（多字节变量）",
+        "用宏替换全局变量做测试stub——宏是文本替换，无法区分不同模块的同名stub，导致测试互相干扰"
+      ],
+      "refBook": ["《C陷阱与缺陷》ch7", "《人月神话》ch1"]
+    },
+    {
+      "id": "2026-06-04-refactor-global-to-handle",
+      "title": "重构：从全局变量到句柄——渐进式解耦",
+      "topic": "嵌入式C模块解耦与全局变量之恶",
+      "mode": "refactor",
+      "language": "C",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "pattern",
+      "difficulty": "intermediate",
+      "tags": ["重构", "全局变量", "句柄模式", "渐进式"],
+      "explanation": "《重构》第2章强调：重构不是推倒重来，而是在保持功能正确的前提下逐步改进结构。Fowler 提出了著名的 '保存原始版本' 策略——在嵌入式领域，这意味着先在模块内部做局部重构（把 extern 改为 static），编译验证通过后再逐步对外暴露句柄接口，最后才迁移调用方。每一步都可以单独回滚，这就是渐进式重构的安全网。正如书中所述「重构的第一步是识别当前系统的正确行为，然后用测试证明它」，在嵌入式中没有单元测试框架时，编译通过 + 功能验证就是测试。",
+      "content": "假设你接手了一个 3 年未重构的 STM32 项目，.c 文件间通过 47 个 extern 变量互相引用。一次性全部改成句柄模式会导致几百处调用点需要修改，git diff 大得无法 review。正确的渐进式策略分三个阶段，每个阶段都可以单独编译通过：\n\n阶段一：把 extern 变量改为 static，在模块内部编写 getter/setter 函数。此时对外接口不变，但模块获得了封装。这一步零风险，因为调用方代码一行都不用改。\n\n阶段二：在 .h 中定义句柄结构体（含所有原 extern 变量），提供 init() 函数分配并填充句柄。新代码开始使用句柄接口，旧代码仍然能用全局变量。两者可以共存。\n\n阶段三：迁移所有调用方到新句柄接口，删除残留的全局变量。这是唯一需要修改调用方的阶段，但因为有阶段一的 getter/setter 作为中间层，迁移过程可以逐文件进行，每次只改一个 .c 文件的调用点。\n\n总改动量约 200 行，但分 10 个 commit 提交，每个 commit 都能通过编译和基础测试。",
+      "code": "// === 阶段一：内部封装（对外接口不变）\n// motor.h — 不变\ntypedef struct { int speed; int direction; } motor_config_t;\nvoid motor_init(const motor_config_t* cfg);\nvoid motor_set_speed(int speed);\nint  motor_get_speed(void);\n\n// motor.c — 改动\nstatic motor_config_t g_cfg;       // extern → static\nstatic volatile int   g_speed;     // extern → static + volatile\n\nvoid motor_set_speed(int speed) {  // 新增校验\n    if (speed < -100 || speed > 100) return;\n    g_speed = speed;\n    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, speed + 100);\n}\n\nint motor_get_speed(void) {      // 新增临界区\n    int s;\n    __disable_irq();\n    s = g_speed;\n    __enable_irq();\n    return s;\n}\n\n// === 阶段三：调用方迁移（逐文件改）\n// 改前：main.c 直接读写全局变量\n//   extern int g_speed;\n//   g_speed = 50;\n// \n// 改后：main.c 通过模块函数\n//   #include \"motor.h\"\n//   motor_set_speed(50);\n//   int current = motor_get_speed();\n\n// === 阶段三终极形态：句柄（多实例支持）\ntypedef struct { TIM_TypeDef* tim; uint32_t ch; volatile int speed; } motor_t;\nmotor_t* motor_create(TIM_TypeDef* tim, uint32_t ch);\nvoid motor_destroy(motor_t* m);\nvoid motor_set_speed(motor_t* m, int speed);\n// 一个 PWM 外设上挂两个电机，各自独立控制",
+      "pitfalls": [
+        "阶段一和阶段二之间留太久——旧全局变量和新句柄并存超过一周，团队会忘记哪个是新的",
+        "迁移时直接删掉 getter/setter 而忘记内联——函数调用开销在实时路径上可能超标",
+        "句柄用 malloc 分配——在资源紧张的系统（<32KB RAM）上，句柄应该用栈分配或静态池"
+      ],
+      "refBook": ["《重构》ch2", "《C语言接口与实现》ch5"]
+    }
+  ]
+}
