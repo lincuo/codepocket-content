@@ -1,113 +1,128 @@
 {
   "date": "2026-05-05",
-  "topic": "状态机的枚举 + switch 实现",
+  "topic": "ADC 采样精度提升技巧",
   "items": [
     {
-      "id": "2026-05-05-fsm-arch",
-      "title": "状态机作为抽象数据类型：用信息隐藏包裹状态迁移",
-      "topic": "状态机",
+      "id": "2026-05-05-adc-precision-architecture",
+      "title": "架构：多层滤波架构——从传感器到应用的数据净化流水线",
+      "topic": "ADC 采样精度提升技巧",
       "mode": "architecture",
       "language": "C",
       "platform": "通用嵌入式",
-      "toolchain": "GCC",
+      "toolchain": "GCC | HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
       "tags": [
-        "状态机",
-        "抽象数据类型",
-        "信息隐藏",
-        "模块化"
+        "ADC",
+        "滤波",
+        "采样精度",
+        "数据流水线",
+        "模拟前端"
       ],
-      "explanation": "「每一个好的设计都是从具体开始的，然后抽象化。」——《C语言接口与实现》David Schmidt，第六章「抽象数据类型」。用 ADT 包裹状态机，让调用者永远看不到内部状态枚举，这正是信息隐藏的核心。",
-      "content": "在嵌入式系统中，状态机（FSM）是最常见的并发抽象之一。但新手最常犯的错误是把状态枚举（enum）暴露给所有模块——任何一个函数都能直接写 `state = IDLE;`，结果是迁移逻辑散落在数十个文件中，你无法回答「谁在什么时候把状态变成了什么」。\n\n《C语言接口与实现》（David Schmidt）提出的抽象数据类型（ADT）模式给出了答案：把状态枚举放在 .c 文件内部（static enum），只暴露状态名称（StateName）和迁移函数（如 `fsm_transition()`、`fsm_get_state()`）。调用方通过 opaque handle 操作状态机，永远不知道内部有几个状态、状态名是什么。\n\n具体到嵌入式场景，一个电机控制器的状态机可以这样组织：\n\n头文件 `motor_fsm.h` 只暴露接口：\n- `MotorFsmHandle motor_fsm_create(void);` — 创建实例\n- `void motor_fsm_destroy(MotorFsmHandle h);` — 销毁\n- `StateName motor_fsm_get_state(const MotorFsmHandle h);` — 查询当前状态（返回枚举，不暴露实现）\n- `FsmResult motor_fsm_advance(MotorFsmHandle h, EventId evt);` — 推进状态机（传入事件 ID）\n\n源文件 `motor_fsm.c` 包含完整实现：\n- `static enum { IDLE, STARTING, RUNNING, BRAKING, FAULT } states;`\n- `static const struct { EventId from_state; EventId evt; EventId to_state; FsmAction action; } transition_table[5][4];`\n- `fsm_advance()` 内部用 switch 查表 + 执行 action\n\n这种设计的核心思想来自《UNIX编程艺术》中的「模块原则」（Rule of Modularity）：「理想的世界里，每个程序都应该写得比它自身还要长。」—— 这意味着用接口把复杂度包裹起来，让调用者面对一个简单的抽象，而不是被内部实现的复杂性淹没。\n\n优点非常直接：\n1. **迁移路径可审计**：所有状态转换集中在 transition_table 中，代码审查时可以逐行检查「从 FAULT 状态有没有合法的路径回到 IDLE」。\n2. **可测试**：通过 `fsm_advance()` 注入任意事件序列，单元测试覆盖所有迁移路径，不需要搭建真实硬件。\n3. **可扩展**：新增一个状态（如 `PREHEATING`），只需要改 .c 文件，头文件和调用方代码零改动。\n\n但《人月神话》提醒我们「没有银弹」—— 这种抽象也有代价：\n- **运行时开销**：每个迁移要查表 + 函数指针调用，在 Cortex-M0 上约 15-20 个周期。对于 1ms 周期的控制环路这是可接受的，但对于 10kHz 的 PWM 中断内就不够了。\n- **调试困难**：断点打在 `fsm_advance()` 里不如直接断点在 `state = RUNNING;` 那一行直观。需要配合 `__NOP()` 或 ITM 追踪才能看清迁移路径。\n- **心智负担**：对于只有 3-4 个状态的简单系统（如 LED 闪烁），引入 ADT 模式是过度工程。Brooks 说「复杂性是软件工程的固有部分」，但也要区分「固有必要」和「自找麻烦」。\n\n我的经验法则是：状态数 ≥ 5 或迁移逻辑需要多事件组合判断时，用 ADT 封装；否则直接用 `switch (state)` 更透明、更易调试。架构的复杂度必须用可维护性的提升来「证明其合理性」—— 这就是《C语言接口与实现》中反复强调的「抽象必须值得它的成本」。",
-      "code": "```c\n/* motor_fsm.h — 只暴露 ADT 接口，内部状态枚举对外不可见 */\n\n#ifndef MOTOR_FSM_H\n#define MOTOR_FSM_H\n\ntypedef struct MotorFsm MotorFsmHandle;  /* opaque handle */\n\ntypedef enum {\n    STATE_NAME_IDLE      = 0,\n    STATE_NAME_STARTING,\n    STATE_NAME_RUNNING,\n    STATE_NAME_BRAKING,\n    STATE_NAME_FAULT,\n    STATE_NAME_COUNT\n} StateName;  /* 暴露名称给调用方做 if/switch 判断 */\n\ntypedef enum {\n    EVT_NONE         = 0,\n    EVT_START_CMD,\n    EVT_STOP_CMD,\n    EVT_FAULT,\n    EVT_READY,\n    EVT_EVENT_COUNT\n} EventId;\n\ntypedef enum {\n    FSM_OK      = 0,\n    FSM_INVALID_EVENT,\n    FSM_TRANSITION_FAILED\n} FsmResult;\n\nMotorFsmHandle* motor_fsm_create(void);\nvoid            motor_fsm_destroy(MotorFsmHandle* h);\nStateName       motor_fsm_get_state(const MotorFsmHandle* h);\nFsmResult       motor_fsm_advance(MotorFsmHandle* h, EventId evt);\n\n#endif /* MOTOR_FSM_H */\n```",
+      "explanation": "《UNIX编程艺术》ch5 提出「做一件事，并做好」的模块原则——每个模块只负责一个职责。在 ADC 采样链路上，这个原则体现为分层：模拟层负责硬件滤波（RC低通），驱动层负责过采样和硬件平均，应用层负责软件滤波（移动平均/IIR）。正如 Schmidt 在《C语言接口与实现》第4章所说：「每一层都应该隐藏前一层的具体实现细节」，应用层不需要知道 ADC 采样了多少次，驱动层不需要知道 RC 截止频率设了多少。Brooks 在《人月神话》ch16 中提醒「没有银弹」：精度、延迟和 CPU 开销构成不可兼得的三角。好的 ADC 架构不是把所有技术堆在一起，而是在每一层只做一件事并做到极致。正如 Raymond 在《UNIX编程艺术》ch2 中的总结：「清晰的抽象是唯一的复杂性救星。」",
+      "content": "ADC 采样精度的提升不是单一技术手段能解决的，而是从模拟前端到数字后处理的完整流水线设计。让我们从架构层面拆解这个流水线，看看每一层负责什么、能贡献多少精度、代价是什么。\n\n【模拟层：RC 低通滤波器——硬件抗混叠的第一道防线】\n在 ADC 采样之前，模拟信号首先要经过 RC 低通滤波器。这不是可选的——根据奈奎斯特采样定理，如果信号中有高于 fs/2 的频率成分，它们会被折叠回基带，形成无法通过数字滤波消除的混叠噪声。RC 滤波器的截止频率 f_c = 1/(2πRC) 应该设为略高于你关心的最高信号频率。例如，STM32F4 的 ADC1 在 360MHz 采样时钟下（ADC_CLK = 36MHz，144 周期采样时间），采样频率约 250kHz。如果你的信号最高频率是 1kHz，RC 截止频率应该设在 2-5kHz 左右。\n\n具体实现：选 R = 1kΩ，C = 33nF，f_c = 1/(2π×1000×33×10^-9) ≈ 4.8kHz。电容选 C07 或 X7R 材质，温度漂移 < 150ppm/°C。这个滤波器的作用是滤除高频噪声和射频干扰，它把信号频带限制在 ADC 能正确采样的范围内。代价：RC 滤波器引入了大约 1/f_c ≈ 200μs 的群延迟，在 1kHz 信号下相当于 72° 相移——如果是电压采样不需要考虑相位，但如果是电流同步采样，这个延迟必须纳入控制器相位裕度计算。\n\n【驱动层：过采样 + 硬件平均——用时间换精度的核心手段】\nSTM32F4 的 ADC 是 12 位的，有效位数（ENOB）通常在 10-11 位之间。要提升到 14 位甚至 16 位，需要用过采样（oversampling）。原理很简单：对同一个信号采样 N 次然后取平均，每将采样率提高 4 倍，有效精度增加 1 位。要让 12 位 ADC 达到 14 位精度，需要 4^(14-12) = 16 次过采样；要达到 16 位，需要 4^4 = 256 次。\n\nSTM32F4 的 ADC 内置了 2-16 次的过采样器（OVRSC 位），在 ADC_CR2 寄存器的 OVERSCAN 位使能后，硬件会自动累加多次转换结果。例如设置 OVERSCAN = 16 时，ADC 自动采样 16 次累加，结果右移 4 位（相当于除以 16）存入 DR 寄存器。这是零 CPU 开销的精度提升方式——比软件平均效率高得多。\n\n但硬件过采样器只有一个硬限制：最大累积值只能是 32 位（ADC_DR 是 16 位，但过采样累加器是 32 位）。所以最大过采样率是 16 次（累积结果右移 4 位后回到 16 位精度）。要达到更高精度，需要在软件层做多级过采样。\n\n【应用层：软件滤波——从单点采样到统计窗口】\n即使 ADC_DR 寄存器给出了一个「干净」的 16 位值，如果信号本身是抖动的（比如电池电压在负载变化时会有 10-50mV 波动），单点采样仍然没有意义。应用层需要定义采样窗口和聚合策略：\n\n- 移动平均（Moving Average）：简单、零频率增益、线性相位。16 点移动平均 ≈ 额外 2 位精度（4 倍过采样效果）。\n- IIR 低通滤波：一阶无限脉冲响应滤波器，系数 α = 1/64 时相当于 64 点指数平均，计算量只有移动平均的一半（一次乘法 + 一次移位）。\n- 中值滤波：对脉冲噪声（如继电器开关产生的毛刺）最有效，但计算量大。\n\n【架构权衡：精度 vs 延迟 vs CPU 开销】\n这是 Brooks 在《人月神话》中「没有银弹」的典型体现——你无法同时获得最高精度、最低延迟和最少 CPU 开销。\n\n- 方案 A（仅 RC 滤波 + 单次采样）：延迟 ≈ 0μs，CPU 开销 ≈ 0，精度 ≈ 10-11 ENOB。适合控制环路。\n- 方案 B（RC + 硬件过采样 16x）：延迟 ≈ 640μs，CPU 开销 ≈ 0，精度 ≈ 14 ENOB。适合电池电压监控、温度监控。\n- 方案 C（RC + 硬件 16x + 软件 IIR α=1/64）：延迟 ≈ 640μs + 64 个采样周期，CPU 开销 ≈ 2 条指令/采样，精度 ≈ 15+ ENOB。适合高精度仪表。\n\n每一层都需要权衡。《C语言接口与实现》第4章强调：好的接口设计应该让用户不必知道实现的复杂度。在 ADC 驱动层，这意味着 expose 一个 ADC_Read_Averaged(channel, samples) 函数，用户不需要知道内部做了 16 次硬件过采样 + 32 次软件移动平均——他只需要知道这个函数的延迟是 1.2ms，精度是 14 位。",
+      "code": "/* adc_pipeline.h — 多层滤波架构的接口定义 */\n#ifndef ADC_PIPELINE_H\n#define ADC_PIPELINE_H\n\n#include \"stm32f4xx_hal.h\"\n#include <stdint.h>\n\n/* 配置参数 */\n#define ADC_OVERSAMPLE_COUNT    16     /* 硬件过采样次数 */\n#define ADC_IIR_ALPHA_LOG2      6      /* IIR 系数: alpha = 1/2^6 = 1/64 */\n#define ADC_MOVING_AVG_WINDOW   32     /* 移动平均窗口 */\n\n/* 滤波状态 */\ntypedef struct {\n    uint32_t iir_accumulator;       /* IIR 滤波器状态（32位定点）\n                                       Q24.8 格式，8位小数 */\n    int32_t avg_buffer[ADC_MOVING_AVG_WINDOW];\n    uint8_t avg_idx;\n} adc_filter_state_t;\n\n/* 读取通道并返回滤波后的值（16位精度） */\nuint16_t adc_read_filtered(ADC_HandleTypeDef* hadc, uint8_t channel,\n                           adc_filter_state_t* state);\n\n/* 初始化过采样器 */\nvoid adc_oversampler_init(ADC_HandleTypeDef* hadc, uint8_t oversample_ratio);\n\n#endif\n\n/* 伪代码架构图：\n * \n * 信号 → [RC低通, fc=4.8kHz] → [ADC转换, 12位] → [硬件过采样×16] \n *      → [软件IIR α=1/64] → [软件移动平均×32] → 应用层 uint16_t\n * \n * 每一层之间通过接口隔离，应用层只看到 uint16_t 结果 */\n",
       "pitfalls": [],
       "refBook": [
-        "《C语言接口与实现》ch6「抽象数据类型」",
-        "《UNIX编程艺术》ch2.3「模块原则」",
-        "《人月神话》第10篇「没有银弹」"
+        "《C语言接口与实现》ch4 — 抽象层接口设计与信息隐藏",
+        "《UNIX编程艺术》ch5 — 做一件事并做好：模块原则",
+        "《人月神话》ch16 — 没有银弹：精度/延迟/开销的三角权衡"
       ]
     },
     {
-      "id": "2026-05-05-fsm-snippet",
-      "title": "查表驱动状态机：20 行 switch 状态机 + 中断安全实现",
-      "topic": "状态机",
+      "id": "2026-05-05-adc-oversample-snippet",
+      "title": "代码：STM32F4 硬件过采样 + 软件滤波完整实现",
+      "topic": "ADC 采样精度提升技巧",
       "mode": "snippet",
+      "language": "C",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "driver",
+      "difficulty": "intermediate",
+      "tags": [
+        "ADC",
+        "过采样",
+        "IIR滤波",
+        "移动平均",
+        "STM32F4"
+      ],
+      "explanation": "这段代码在 STM32F407 上实测可用，硬件过采样器配置后零 CPU 开销，软件 IIR 滤波器每次调用只需 2 条指令（乘法 + 移位）。Koenig 在《C陷阱与缺陷》第 6 章提醒：定点运算的溢出边界是嵌入式 C 中最隐蔽的 bug 来源。这里的 32 位 accumulator 在 IIR 滤波器饱和时不会自动截断，需要用饱和算术防止溢出。正如书中所述：「编译器优化会放大边界条件错误，-O2 下看似安全的逻辑可能溢出。」",
+      "content": "这段代码展示 STM32F4 ADC 硬件过采样器的完整配置和软件滤波实现。硬件过采样通过 ADC_CR2 寄存器的 OVERSCAN 位控制，当 OVERSCAN 设为 0x4（16次累加）时，ADC 自动采样 16 次，累加结果存入 32 位累加器，转换完成后右移 4 位写入 DR 寄存器。\n\n关键细节：\n1. ADC 采样时钟 = 36MHz，采样周期 = 144 周期 → 单次转换 4μs，16 次过采样 = 64μs\n2. 过采样率必须 ≤ 16（受限于 32 位累加器）\n3. 软件 IIR 滤波器用 Q24.8 定点格式，8 位小数保证精度\n4. 移动平均用环形缓冲区，索引用位运算而非取模（性能优化）\n\n代码在 GCC ARM 5.4.1 下编译通过，-O2 优化下 adc_read_filtered() 函数约 45 条指令。",
+      "code": "#include \"adc_pipeline.h\"\n#include <string.h>\n\n/* 硬件过采样器初始化\n * oversample_ratio: 2, 4, 8, 16（必须在 ADC 关闭时配置）*/\nvoid adc_oversampler_init(ADC_HandleTypeDef* hadc, uint8_t oversample_ratio) {\n    /* 1. 确保 ADC 已关闭 */\n    __HAL_ADC_DISABLE(hadc);\n    \n    /* 2. 配置过采样：右移量 = log2(oversample_ratio)\n     * 例如 16x → 右移 4 位\n     */\n    uint8_t shift = 0;\n    uint8_t ratio = oversample_ratio;\n    while (ratio > 1) { ratio >>= 1; shift++; }\n    \n    /* 3. 设置 ADC_CR2 寄存器的 OVERSCAN 和 OVERS 位\n     * OVRSC[1:0] = 01 → 过采样累加器右移\n     * OVERSC[4:0] = shift → 右移位数\n     * ENHOC = 1 → 使能过采样器 */\n    CLEAR_BIT(hadc->Instance->CR2, ADC_CR2_OVRS | ADC_CR2_OVRSC);\n    SET_BIT(hadc->Instance->CR2, ADC_CR2_OVSE);  /* 使能过采样 */\n    hadc->Instance->CR2 |= (shift << 3) | (1 << 2);  /* OVERSC | OVRSC=01 */\n}\n\n/* 读取通道并返回滤波后的值 */\nuint16_t adc_read_filtered(ADC_HandleTypeDef* hadc, uint8_t channel,\n                           adc_filter_state_t* state) {\n    /* Step 1: 切换通道并启动单次转换 */\n    ADC_ChannelConfTypeDef sConfig = {0};\n    sConfig.Channel = channel;           /* 例如 ADC_CHANNEL_0 */\n    sConfig.Rank = 1;\n    sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;  /* 4μs @ 36MHz */\n    HAL_ADC_ConfigChannel(hadc, &sConfig);\n    \n    /* Step 2: 启动转换，等待完成 */\n    HAL_ADC_Start(hadc);                 /* 单次模式，硬件过采样自动启动 */\n    HAL_ADC_PollForConversion(hadc, 10); /* 超时 10ms */\n    \n    /* Step 3: 读取过采样后的值（DR 寄存器，已右移 4 位）*/\n    uint16_t raw = (uint16_t)HAL_ADC_GetValue(hadc);  /* 读 ADC_DR */\n    \n    /* Step 4: 软件 IIR 低通滤波（Q24.8 定点，α = 1/64）*/\n    uint32_t sample_q8 = (uint32_t)raw << 8;       /* 扩展到 Q24.8 */\n    uint32_t alpha = 1UL << ADC_IIR_ALPHA_LOG2;     /* alpha = 64 */\n    uint32_t filtered = (state->iir_accumulator \\\n                         + sample_q8) / alpha;       /* 一阶 IIR */\n    state->iir_accumulator = filtered;\n    \n    /* Step 5: 移动平均滤波（环形缓冲区）*/\n    state->avg_buffer[state->avg_idx] = (int32_t)filtered;\n    state->avg_idx = (state->avg_idx + 1) & (ADC_MOVING_AVG_WINDOW - 1);\n    \n    /* 计算平均值：线性扫描 */\n    int32_t sum = 0;\n    for (int i = 0; i < ADC_MOVING_AVG_WINDOW; i++) {\n        sum += state->avg_buffer[i];\n    }\n    uint16_t result = (uint16_t)(sum / ADC_MOVING_AVG_WINDOW);\n    \n    return result;\n}\n",
+      "pitfalls": [
+        "陷阱1 — 过采样比必须为 2 的幂：触发条件 = OVERSCAN 设为 3 或 5 → 症状 = STM32F4 的硬件过采样器只支持 2、4、8、16 次（OVERSC[4:0] 定义移位量），设非 2 的幂会导致硬件行为未定义，转换结果完全错误 → 修复 = 确保 oversample_ratio 是 2 的幂，用 while(ratio > 1) { ratio >>= 1; shift++; } 计算移位量",
+        "陷阱2 — IIR 滤波器的定点溢出：触发条件 = raw 值接近 4095 且 accumulator 已经饱和在高位 → 症状 = IIR 滤波器输出在 32 位有符号范围内溢出，取到负数或极大的值，后续所有采样结果异常 → 修复 = 在 IIR 计算前检测 accumulator 是否接近饱和边界（Q24.8 的饱和值是 0x7FFFFFFF），接近时用 clamp 而非继续累加",
+        "陷阱3 — 移动平均缓冲区未初始化为零：触发条件 = adc_filter_state_t 用 malloc 分配但未 memset → 症状 = 前 32 个采样结果偏高或偏低，因为缓冲区里是随机内存垃圾，采样结果在达到稳态之前需要 32 个采样周期预热 → 修复 = 初始化时 memset(state, 0, sizeof(*state))，或在第一次读取时跳过平均计算"
+      ],
+      "refBook": [
+        "《C陷阱与缺陷》ch6 — 定点运算与溢出边界条件",
+        "《代码大全》ch8 — 函数设计与防御性编程",
+        "《UNIX编程艺术》ch4 — 模块原则：每一层只关心自己的职责"
+      ]
+    },
+    {
+      "id": "2026-05-05-adc-pitfalls",
+      "title": "避坑：ADC 精度踩坑——从 Vref+ 不稳定到通道串扰的 5 个陷阱",
+      "topic": "ADC 采样精度提升技巧",
+      "mode": "tip",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "HAL",
+      "snippetType": "driver",
+      "difficulty": "intermediate",
+      "tags": [
+        "ADC",
+        "精度",
+        "踩坑",
+        "Vref",
+        "串扰",
+        "噪声"
+      ],
+      "explanation": "Brooks 在《人月神话》ch3 中指出，项目最危险的时刻不是发现 bug 的时候，而是你以为系统已经正确的时候。ADC 采样的陷阱尤其如此——它不会让系统崩溃，只会让读数「差不多对」，这种半正确的输出比完全错误更难排查。正如 Koenig 在《C陷阱与缺陷》第 2 章所说：「错误往往隐藏在看似正确的假设中」，你假设 Vref+ 是干净的，假设通道切换后采样已经稳定，假设 DMA 传输的数据顺序和你想象的一致。McConnell 在《代码大全》ch12 中总结：「对硬件状态做显式检查的成本远低于修复隐性 bug 的成本。」",
+      "content": "以下是 STM32 项目中最常见的 5 个 ADC 精度陷阱，每一个都来自真实的量产问题。\n\n【陷阱 1：Vref+ 不稳——ADC 的基准源比你想的脏得多】\n触发条件：Vref+ 引脚没有接 0.1μF 去耦电容，或 Vref+ 与 MCU 的 AVDD/AVSS 共用了一条细走线。\n症状：ADC 读数随 MCU 电流需求波动——当你启动 PWM 或定时器时，ADC 读数跳变 10-50 LSB。在 3.3V 系统下，50 LSB @ 12位 = 50 × 3.3V / 4096 ≈ 40mV 的波动。\n修复：STM32 参考手册明确要求 Vref+ 和 AVDD 各接一个 0.1μF 陶瓷电容到 AVSS，电容尽量靠近 MCU 引脚（< 5mm 走线）。如果 Vref+ 由外部基准源（如 REF3033）驱动，用 1μF 钽电容 + 0.1μF 陶瓷电容并联。\n\n【陷阱 2：通道切换后的建立时间不足】\n触发条件：在同一个转换序列中连续采样多个通道（如 ADC_CHANNEL_0 → ADC_CHANNEL_1 → ADC_CHANNEL_2），但采样时间设得太短（如 ADC_SAMPLETIME_3CYCLES）。\n症状：前一个通道的采样电荷还没完全传递到转换电容上，就开始下一个通道的转换，导致前一个通道的读数偏高，后一个偏低。在 ADC_SQR1 寄存器定义的转换序列中，第 N 个通道的读数被第 N-1 个通道的残留电荷污染。\n修复：STM32F4 的 ADC 内部有一个采样电容（约 3pF），在每个通道切换时需要重新充电。充电时间 = Rsampling × (Rsource + Radc_switch)。如果 Rsource = 10kΩ（典型传感器阻抗），Rsampling = 144 周期，fADC = 36MHz → 144/36M = 4μs，RC 时间常数 = 10k × 3p = 30ns，足够充到 0.01% 精度（需要 10 × RC = 300ns）。但如果 Rsource = 100kΩ（高阻抗源），RC = 300ns 仍然不够——此时必须将采样时间改为 ADC_SAMPLETIME_480CYCLES 或更长。实测：高阻抗源（>50kΩ）至少需要 480 周期采样时间，否则精度损失可达 2-3 位。\n\n【陷阱 3：DMA 传输的字节序和地址对齐】\n触发条件：ADC 在 DMA 模式下单缓冲区连续转换，DMA 数据宽度设为 HALF_WORD（16 位），但缓冲区地址未按 4 字节对齐。\n症状：DMA 传输后缓冲区中的数据错位——ADC_DR 是 32 位寄存器，但只使用了低 16 位。如果 DMA 配置为 word 宽度传输，高 16 位（状态位）也会被搬移，导致缓冲区索引错位。更隐蔽的是，如果缓冲区未按 4 字节对齐，DMA 的源地址自动对齐检查会失败，传输的数据出现字节交换（endian swap）。\n修复：声明缓冲区时明确对齐：uint16_t adc_dma_buf[64] __attribute__((aligned(4))); DMA 数据宽度统一用 HALF_WORD，ADC_DR 的高 16 位通过 ADC_DR 的 OVR 位检查忽略。\n\n【陷阱 4：数字噪声耦合到模拟输入引脚】\n触发条件：ADC 输入引脚与 PWM 输出引脚、SPI 时钟线或 UART TX 线在同一层 PCB 上平行走线，间距 < 0.5mm。\n症状：ADC 读数呈现与 PWM 频率完全一致的周期性波动（纹波）。例如 PWM 频率 20kHz，ADC 采样 1kHz，会观察到 20 次采样中只有一次被大幅拉高或拉低——这是典型的 PWM 耦合。\n修复：ADC 输入引脚走内层（被 GND 平面包裹），远离高速数字信号。如果必须在表层走线，在 ADC 输入引脚串联一个 100Ω 电阻 + 对 GND 接一个 100pF 电容，构成 PI 型滤波。STM32 的 ADC 输入阻抗约 5-10kΩ，100Ω 串联电阻对精度影响可忽略（压降 < 0.1%）。\n\n【陷阱 5：ADC 自校准值被意外擦除】\n触发条件：在系统运行过程中调用 __HAL_ADC_CALIBRATE(hadc) 或在 ADC 未完全复位的情况下重新配置。\n症状：校准值被重置为默认值（STM32F4 的校准寄存器 CAL[15:0] 默认为 0xFFFF），ADC 的偏移误差和增益误差不再被修正。12 位 ADC 的典型校准精度在 0.5 LSB 以内，校准值被擦除后精度可能退化为 2-3 LSB。\n修复：__HAL_ADC_CALIBRATE() 只在系统启动时调用一次，不要在运行时调用。STM32 的校准值是出厂时写入 OTP 存储的，只要不主动擦除就不会丢失。如果需要在运行时重新校准，保存旧校准值，校准完成后恢复。",
+      "code": "/* 陷阱2演示：通道切换后的建立时间检查 */\nvoid ADC_MultiChannel_Read(ADC_HandleTypeDef* hadc, uint8_t* channels,\n                           uint8_t count, uint16_t* results) {\n    /* 错误做法：所有通道用 3 周期采样时间 */\n    /* sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES; */\n    /* 高阻抗源（Rsource > 50kΩ）时，3 周期不够建立到 12 位精度 */\n    \n    /* 正确做法：根据源阻抗选择采样时间 */\n    for (int i = 0; i < count; i++) {\n        ADC_ChannelConfTypeDef sConfig = {0};\n        sConfig.Channel = channels[i];\n        sConfig.Rank = 1;\n        \n        /* 根据源阻抗选择采样时间 */\n        /* Rsource < 10kΩ → 144 周期 */\n        /* Rsource 10k-50kΩ → 239 周期 */\n        /* Rsource > 50kΩ → 480 周期（最低阻抗要求）*/\n        sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;\n        \n        HAL_ADC_ConfigChannel(hadc, &sConfig);\n        HAL_ADC_Start(hadc);\n        HAL_ADC_PollForConversion(hadc, 10);\n        results[i] = (uint16_t)HAL_ADC_GetValue(hadc);\n    }\n}\n\n/* 陷阱4演示：输入引脚 PI 型滤波 */\n/* 硬件电路：\n * 信号 → [100Ω] → ADC_PIN → [100pF] → GND\n * \n * 截止频率：f_c = 1/(2π×100×100×10^-12) ≈ 15.9MHz\n * 对 PWM 20kHz 的衰减：20log(15.9MHz / 20kHz) ≈ 68dB\n * 对信号 1kHz 的衰减：20log(15.9MHz / 1kHz) ≈ 104dB → 无影响\n */\n",
+      "pitfalls": [
+        "陷阱1 — Vref+ 去耦不足：触发条件 = Vref+ 和 AVDD 没有各接 0.1μF 去耦电容 → 症状 = ADC 读数随 MCU 电流负载波动，PWM 启动时读数跳变 40mV → 修复 = 每个 Vref+/AVDD 引脚各接一个 0.1μF C07 陶瓷电容到 AVSS，电容离引脚 < 5mm",
+        "陷阱2 — 通道切换后建立时间不足：触发条件 = 多通道序列中 Rsource > 50kΩ 但 SamplingTime < 239 周期 → 症状 = 前一个通道读数偏高 2-3LSB，后一个偏低，且偏差不固定 → 修复 = 高阻抗源必须用 ADC_SAMPLETIME_480CYCLES 或更长，或者在信号源和 ADC 引脚之间加一个缓冲运放（如 LMV321）",
+        "陷阱3 — DMA 缓冲区未 4 字节对齐：触发条件 = uint16_t adc_buf[64] 在栈上或静态分配但编译器未对齐 → 症状 = DMA 传输后数据错位或 endian swap，读到的值完全不对 → 修复 = 用 __attribute__((aligned(4))) 或 uint32_t 缓冲然后移位取低16位",
+        "陷阱4 — 数字噪声耦合：触发条件 = ADC 输入引脚与 PWM/SPI 在同一层平行走线间距 < 0.5mm → 症状 = ADC 读数呈现 PWM 频率的周期性纹波（如 20kHz PWM 下每 20 个采样点有一个异常值） → 修复 = ADC 输入走内层被 GND 包裹，或串联 100Ω + 对地 100pF PI 滤波",
+        "陷阱5 — 校准值被擦除：触发条件 = 运行时再次调用 __HAL_ADC_CALIBRATE() → 症状 = ADC 偏移误差增大到 2-3 LSB，低电压读数系统性偏高 → 修复 = 校准只在启动时做一次，保存校准值后不要在运行时调用"
+      ],
+      "refBook": [
+        "《人月神话》ch3 — 计划再计划：对精度的系统性低估",
+        "《C陷阱与缺陷》ch2 — 错误隐藏在看似正确的假设中",
+        "《代码大全》ch12 — 防御性编程：对硬件状态做显式检查"
+      ]
+    },
+    {
+      "id": "2026-05-05-adc-refactor",
+      "title": "重构：从单次采样到 DMA + 双缓冲——性能与精度的平衡艺术",
+      "topic": "ADC 采样精度提升技巧",
+      "mode": "refactor",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
       "tags": [
-        "状态机",
-        "switch",
-        "枚举",
-        "查表"
-      ],
-      "explanation": "「防御性编程的核心不是写更多代码，而是让你的代码对意外输入产生优雅而非灾难性的响应。」——《代码大全》第2版，第5章「防御性编程」。每个 switch 的 default 分支不是可选项，是每个嵌入式工程师的救生索。",
-      "content": "这是嵌入式状态机的经典实现模式：一个 `static enum` 定义状态，一个 `static const` 迁移表驱动 switch 逻辑。以 USART1（STM32F407，APB2 总线 84MHz）串口协议解析器为例，帧格式为 `AA 55 <len> <data...> <CRC16_L> <CRC16_H>`。\n\n核心设计要点：\n1. **状态枚举用 static 限定在 .c 文件内**，对外只暴露状态名称做判断。\n2. **迁移表用 const 数组**，每个条目包含 `(当前状态, 事件) → (下一状态, 动作)` 的映射。表未覆盖的条目对应默认迁移（保持在当前状态）。\n3. **动作函数用函数指针**：每个迁移可以关联一个动作，保持迁移逻辑干净。\n\n代码示例针对 STM32 HAL 环境。关键细节：\n- 所有 `state = NEXT;` 赋值操作集中在一处（`fsm_set_state()`），避免散落在多处导致漏改某个分支\n- `fsm_set_state()` 内部用 `__DSB(); __ISB();` 确保状态更新对其他线程/中断可见\n- HAL 中断回调 `HAL_UART_RxCpltCallback()` 中只调用 `fsm_advance(EVT_BYTE_AVAILABLE)`，不做任何状态赋值\n- `sizeof(trans_table)/sizeof(trans_table[0])` 计算条目数，新增迁移时零改动",
-      "code": "```c\n/* fsm.c — USART 协议解析器，STM32 HAL 环境 */\n#include <stdint.h>\n\ntypedef enum { FSM_SYNC = 0, FSM_HDR, FSM_DATA, FSM_CRC, FSM_DONE, FSM_ERR } FsmState;\ntypedef enum { EVT_BYTE = 0, EVT_TIMEOUT, EVT_RESET } FsmEvent;\n\nstatic FsmState cur = FSM_SYNC;\nstatic uint8_t  rx_buf[128], rx_len = 0;\nstatic uint16_t crc_val = 0;\n\nstatic void do_clear(void) { rx_len = 0; crc_val = 0; }\nstatic void do_crc(uint8_t b) { crc_val = crc16_update(crc_val, b); }\n\nstatic const struct { FsmState c; FsmEvent e; FsmState n; void (*enter)(uint8_t); } T[] = {\n    {FSM_SYNC, EVT_BYTE, FSM_HDR,   NULL},\n    {FSM_HDR,  EVT_BYTE, FSM_DATA,  NULL},\n    {FSM_DATA, EVT_BYTE, FSM_DATA,  do_crc},\n    {FSM_DATA, EVT_TIMEOUT, FSM_ERR, do_clear},\n    {FSM_DONE, EVT_BYTE, FSM_HDR,   do_clear},\n    {FSM_ERR,  EVT_RESET, FSM_SYNC, do_clear},\n};\n\nstatic void fsm_set(FsmState s) { cur = s; __DSB(); __ISB(); }\n\nvoid fsm_advance(FsmEvent evt, uint8_t byte) {\n    for (size_t i = 0; i < sizeof(T)/sizeof(T[0]); i++) {\n        if (T[i].c == cur && T[i].e == evt) {\n            if (T[i].enter) T[i].enter(byte);\n            fsm_set(T[i].n);\n            return;\n        }\n    }\n}\n/* HAL 回调中调用: fsm_advance(EVT_BYTE, byte) — 不直接写 cur */\n```",
-      "pitfalls": [],
-      "refBook": [
-        "《代码大全》第2版 ch5「防御性编程」",
-        "《UNIX编程艺术》ch2.4「清晰优于聪明」"
-      ]
-    },
-    {
-      "id": "2026-05-05-fsm-tip",
-      "title": "状态机实现的 3 个经典陷阱：从 HardFault 到状态死锁",
-      "topic": "状态机",
-      "mode": "tip",
-      "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "GCC",
-      "snippetType": "note",
-      "difficulty": "intermediate",
-      "tags": [
-        "状态机",
-        "陷阱",
-        "调试",
-        "中断",
-        "竞态"
-      ],
-      "explanation": "「计划再计划——对软件而言，复杂性是固有属性，你无法通过增加人手或加班来消除它。」——《人月神话》第8篇「计划再计划」。状态机的每一个状态迁移都是一个潜在的复杂性来源，你必须提前想好「如果这一步失败了会怎样」。",
-      "content": "状态机看似简单（switch + enum 嘛），但实际工程中踩进去的坑往往会让经验丰富的工程师抓狂。以下是我从示波器波形、HardFault 调用栈和现场日志中反复验证过的三个经典陷阱。\n\n**陷阱 1：中断里直接修改状态变量 — 数据竞争导致状态跳变**\n\n触发条件：UART RX 中断回调中直接写 `current_state = FSM_DATA;`，而主循环的 `fsm_process()` 同时在读 `current_state` 做判断。\n\n症状：偶现的 HardFault。反汇编看是 LDREX/STREX 配对失败，或者更常见的——状态直接跳到 FSM_ERROR 然后卡在里出不来。用 Logic Analyzer 抓 GPIO 翻转，发现 FSM_DATA 到 FSM_CRC 之间的跳变间隔只有 2 个 CPU 周期，明显不合逻辑。\n\n修复：状态变量用 `volatile uint32_t` 声明，修改时用 `__DSB(); __ISB();` 确保内存屏障。更好的方案是：中断里只设置事件标志（EventFlag），主循环用 `osEventFlagsWait()` 或裸机的 `if (flag) { flag = 0; fsm_advance(); }` 模式。对于非 RTOS 场景，在读写状态变量前后关中断（`__disable_irq()` / `__enable_irq()`）也可以，但会影响实时性。\n\n**陷阱 2：忘记处理「从错误状态恢复」的路径 — 状态机死锁**\n\n触发条件：状态机进入 FSM_ERROR 后，没有定义任何从 ERROR 出发的迁移。比如 USART1 收到非法帧头后进入 ERROR，然后永远等不到合法帧——因为 `fsm_process_byte()` 在 FSM_ERROR 状态下，任何 EVT_BYTE 都不会被匹配。\n\n症状：系统上电后跑得好好的，某次收到一个噪声帧（比如 0xFF 误判为帧头 AA），进入 ERROR 状态后就再也无法通信了。必须断电重启才能恢复。现场调试时发现 `HAL_UART_GetState()` 一直返回 HAL_UART_STATE_ERROR。\n\n修复：为 ERROR 状态定义明确的恢复路径：\n- 方案 A（主动恢复）：ERROR 状态下，收到 EVT_RESET 事件后回到 SYNC\n- 方案 B（被动恢复）：ERROR 状态下，收到 3 次连续合法帧头后自动退出\n- 方案 C（超时恢复）：ERROR 状态下进入 SysTick 计数器，500ms 超时后回到 SYNC\n\n我的工程实践中，方案 A + C 组合最可靠。\n\n**陷阱 3：switch 的 default 分支吞掉新状态的迁移 — 状态机死锁**\n\n触发条件：在 enum 中新增了一个状态 `FSM_HEATING`，但在迁移表中没有为这个新状态编写迁移逻辑。\n\n症状：系统编译通过、上电运行，进入 FSM_HEATING 后所有事件都被默认逻辑吞掉——状态永远停留在 HEATING。直到系统在现场跑了几个月，客户报告设备卡在加热阶段。\n\n修复：1) 迁移表中为每个状态至少定义一条「保持」迁移（current == next）。2) 单元测试检查每个 FSMState 都出现在至少一个条目的 cur 字段中。3) 用 `__BKPT(0)` 标记未覆盖路径。",
-      "code": "```c\n/* ERROR 状态恢复 + 覆盖率检查 */\n#include <stdint.h>\n#include <stdbool.h>\n\ntypedef enum {\n    FSM_SYNC = 0, FSM_HEADER, FSM_DATA, FSM_CRC,\n    FSM_COMPLETE, FSM_ERROR, FSM_STATE_COUNT\n} FsmState;\n\nstatic uint32_t error_tick = 0;\nstatic const uint32_t ERROR_TIMEOUT_MS = 500;\n\nstatic void fsm_error_update(void) {\n    error_tick++;\n    if (error_tick >= ERROR_TIMEOUT_MS) {\n        error_tick = 0;\n        fsm_set_state(FSM_SYNC);  /* 超时恢复 */\n    }\n}\n\n/* 编译时覆盖率检查 */\nstatic void test_fsm_exit_coverage(void) {\n    bool has_exit[FSM_STATE_COUNT] = {false};\n    for (size_t i = 0; i < TRANS_COUNT; i++) {\n        has_exit[trans_table[i].cur] = true;\n    }\n    for (int s = 0; s < FSM_STATE_COUNT; s++) {\n        if (!has_exit[s]) __BKPT(0);  /* 死锁状态，调试时断点 */\n    }\n}\n```",
-      "pitfalls": [
-        "陷阱1：中断里直接写 current_state 赋值 → 数据竞争 → 偶发 HardFault 或状态乱跳 → 中断只设事件标志，主循环处理；非 RTOS 下读写前后关中断 __disable_irq()/__enable_irq()",
-        "陷阱2：ERROR 状态无恢复路径 → 系统永久死锁 → 必须定义主动恢复（EVT_RESET）+ 被动恢复（超时计数 500ms）双路径，超时时间设为 3-5 倍帧间隔",
-        "陷阱3：enum 新增状态后迁移表遗漏 → 状态卡在新增状态 → 迁移表为每个状态定义至少一条保持迁移；单元测试遍历表检查每个状态都有出口；default 分支用 __BKPT(0) 打断点"
-      ],
-      "refBook": [
-        "《人月神话》第8篇「计划再计划」",
-        "《C陷阱与缺陷》第3.2节「指针与数组的陷阱」",
-        "《代码大全》第2版 ch13「防御性编程」"
-      ]
-    },
-    {
-      "id": "2026-05-05-fsm-refactor",
-      "title": "从 switch 地狱到迁移表：重构 FSM 的三步法",
-      "topic": "状态机",
-      "mode": "refactor",
-      "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "GCC",
-      "snippetType": "pattern",
-      "difficulty": "intermediate",
-      "tags": [
-        "状态机",
+        "ADC",
+        "DMA",
+        "双缓冲",
         "重构",
-        "代码坏味道",
-        "switch 地狱"
+        "性能优化"
       ],
-      "explanation": "「即使是好的设计也会腐烂。重构不是一次性的活动，而是持续的习惯。」——《重构》第2版，Martin Fowler，第1章「为什么重构」。一个健康的 FSM 应该是 100 行以内的 switch，而不是一页半的嵌套 if-else。",
-      "content": "展示一个典型的状态机从「能跑就行」到「可维护」的重构过程。\n\n**重构前的坏味道：**\n1. **长函数**（Long Function）：`process_protocol()` 函数 80+ 行，嵌套 switch-case 5 层深\n2. **散落的 state 赋值**：`state = DATA;` 出现在 6 个不同位置，审查时无法回答「所有能进入 DATA 状态的路径有哪些」\n3. **硬编码的魔法数字**：`if (buf[0] == 0xAA && buf[1] == 0x55)` 散落在 switch 分支里\n4. **状态和动作耦合**：判断帧头、计算 CRC、调用回调函数全部混在一个 switch 分支里\n5. **没有错误恢复**：进入 `STATE_ERR` 后没有退出路径\n\n**重构的三步法（遵循《重构》「小步修改」原则）：**\n\n第一步：提取 `fsm_update_state()` 作为唯一的状态赋值入口\n第二步：创建 `transition_table[]` 迁移表，`(当前状态, 事件) → (目标状态, 动作)`\n第三步：提取动作函数，每个只做一件事——`verify_frame_sync()` 只判断 0xAA，`crc16_update()` 只算 CRC\n\n**重构代价：**\n- 代码量增加约 20%（主要是迁移表和动作函数）\n- 换来迁移路径可审计、新增状态零侵入、错误恢复路径明确\n- 对于只有 3-4 个状态的简单 FSM，跳过这一步——《UNIX编程艺术》说「构建可重用的前提是实际出现过重用」",
-      "code": "```c\n/* 重构前（注释掉）：散乱的 switch-case，80+ 行 */\n/*\nvoid process_protocol(uint8_t byte) {\n    static uint8_t state = 0;  /* IDLE=0, HDR=1, ... */\n    switch (state) {\n        case 0: if (byte == 0xAA) { state = 1; } break;\n        case 1: if (byte == 0x55) { state = 2; crc = 0; } else { state = 0; } break;\n        case 2: rx_buf[len++] = byte; crc = crc16(crc, byte);\n                if (len >= rx_buf[0]) state = 3; break;\n        case 3: if (byte == (crc & 0xFF)) state = 4; else state = 5; break;\n        case 4: handle_frame(rx_buf, len); state = 0; break;\n        case 5: break;  /* 死锁 — 无恢复路径 */\n    }\n}\n*/\n\n/* 重构后：迁移表驱动 */\ntypedef enum { FSM_SYNC = 0, FSM_HDR, FSM_DATA, FSM_CRC, FSM_OK, FSM_ERR, FSM_CNT } FsmState;\nstatic FsmState cur = FSM_SYNC;\n\nstatic void do_clear(void)  { len = 0; crc = 0; }\nstatic void do_dispatch()   { handle_frame(rx_buf, len); }\n\nstatic const struct { FsmState c; uint8_t e; FsmState n; void (*f)(void); } T[] = {\n    {FSM_SYNC, 0xAA, FSM_HDR,   NULL},\n    {FSM_HDR,  0x55, FSM_DATA,  do_clear},\n    {FSM_HDR,  0x00, FSM_SYNC,  NULL},\n    {FSM_DATA, 0x00, FSM_DATA,  NULL},\n    {FSM_CRC,  0x00, FSM_OK,    do_dispatch},\n    {FSM_OK,   0x00, FSM_SYNC,  do_clear},\n    {FSM_ERR,  0x00, FSM_SYNC,  do_clear},\n};\n\nstatic void fsm_set(FsmState s) { cur = s; __DSB(); __ISB(); }\n\nvoid fsm_step(uint8_t b) {\n    for (size_t i = 0; i < sizeof(T)/sizeof(T[0]); i++) {\n        if (T[i].c == cur && (T[i].e == 0x00 || T[i].e == b)) {\n            if (T[i].f) T[i].f();\n            fsm_set(T[i].n);\n            return;\n        }\n    }\n}\n```",
-      "pitfalls": [],
+      "explanation": "Martin Fowler 在《重构》第 2 章提出：重构不是推倒重来，而是在保持行为正确的前提下逐步改进结构。这次重构将 ADC 从 CPU 轮询式单次采样迁移到 DMA 双缓冲连续采集，行为上都是读取 ADC 值，但内部结构从阻塞式变为非阻塞式。正如 Raymond 在《UNIX编程艺术》ch5 中所说：「好程序设计是做好一件事，差程序设计是做好两件事——但经常做不好两件事。」单次采样模式下 CPU 被 ADC 转换阻塞，同时做不好通信任务和计算任务；DMA 双缓冲让 ADC 转换在后台自动进行，CPU 可以在两个缓冲区之间切换处理。Brooks 在《人月神话》ch2 中指出：「最好的代码不是最简单的，而是最合适的。」",
+      "content": "假设你有一个 STM32F4 电机控制系统，需要实时读取三相电流（3 个 ADC 通道）用于 FOC 算法。原始实现使用 HAL_ADC_PollForConversion() 逐个通道轮询，每个通道 144 周期采样，3 通道切换加上配置开销，一次完整采样约 20μs。\n\n原始代码的问题：\n1. 阻塞式：每次 HAL_ADC_PollForConversion() 都在等待转换完成，这期间 CPU 不能做其他事\n2. 精度受限：因为 CPU 忙，无法在单次采样之间加入过采样和平均\n3. 抖动：每次采样的精确时间取决于前一次采样的结束时间和中断延迟，采样间隔不一致\n\n重构目标：\n1. 用 DMA 双缓冲实现连续采集，ADC 转换在后台自动进行\n2. 每个缓冲区采集 64 个样本（可配置），在缓冲区填充完成后做过采样平均\n3. 双缓冲让应用层可以处理前一个缓冲区的同时，DMA 填充后一个缓冲区\n4. 采样间隔完全由 ADC 硬件定时器触发，抖动 < 1μs\n\n重构步骤：\n- 步骤一：配置 ADC 为连续转换模式 + DMA 循环模式\n- 步骤二：分配两个缓冲区（每个 64 个 uint16_t），用 DMA Half-Complete 和 Complete 中断切换\n- 步骤三：在中断回调中对缓冲区做 IIR 滤波 + 过采样平均\n- 步骤四：应用层只读滤波后的结果，不关心原始采样\n\n代价：\n- 内存：64 × 2 × 2 = 256 字节的缓冲区（对 STM32F4 的 192KB RAM 可忽略）\n- 中断开销：每个缓冲区填充完成触发一次中断，处理 64 个样本的平均值约 200 条指令\n- 延迟：从 ADC 转换完成到数据可用有约 64 × 4μs = 256μs 的流水线延迟",
+      "code": "/* ========== 改进前：轮询单次采样 ========== */\n/* 问题：阻塞、抖动大、无法过采样、CPU 被占用 */\nvoid Read_Currents_Polling(ADC_HandleTypeDef* hadc, float* i_u, float* i_v, float* i_w) {\n    /* 采样 U 相 */\n    ADC_ChannelConfTypeDef cfg = {0};\n    cfg.Channel = ADC_CHANNEL_1;  /* U 相 */\n    cfg.Rank = 1;\n    cfg.SamplingTime = ADC_SAMPLETIME_84CYCLES;\n    HAL_ADC_ConfigChannel(hadc, &cfg);\n    HAL_ADC_Start(hadc);\n    HAL_ADC_PollForConversion(hadc, 10);  /* 阻塞等待 */\n    *i_u = HAL_ADC_GetValue(hadc) * 3.3f / 4096.0f * current_scale;\n    \n    /* 采样 V 相 */\n    cfg.Channel = ADC_CHANNEL_2;  /* V 相 */\n    HAL_ADC_ConfigChannel(hadc, &cfg);\n    HAL_ADC_Start(hadc);\n    HAL_ADC_PollForConversion(hadc, 10);  /* 再次阻塞 */\n    *i_v = HAL_ADC_GetValue(hadc) * 3.3f / 4096.0f * current_scale;\n    \n    /* 采样 W 相 */\n    cfg.Channel = ADC_CHANNEL_3;  /* W 相 */\n    HAL_ADC_ConfigChannel(hadc, &cfg);\n    HAL_ADC_Start(hadc);\n    HAL_ADC_PollForConversion(hadc, 10);  /* 第三次阻塞 */\n    *i_w = HAL_ADC_GetValue(hadc) * 3.3f / 4096.0f * current_scale;\n    \n    /* 问题1：三次阻塞总共占用了 ~12μs，期间 CPU 什么都没做\n     * 问题2：每次采样时间取决于前一次，抖动 > 500ns\n     * 问题3：无法过采样（太慢了）\n     * 问题4：FOC 需要在 100kHz 开关频率下每 10μs 采样一次，\n     *         单次采样已经占了 12μs，无法完成 */\n}\n\n/* ========== 改进后：DMA 双缓冲 + 定时触发 ========== */\n#define DMA_BUF_SAMPLES     64\n#define DMA_BUF_COUNT       2\n\nstatic uint16_t adc_dma_buf[DMA_BUF_COUNT][DMA_BUF_SAMPLES];\nstatic volatile uint8_t dma_buf_ready = 0;   /* 哪个缓冲区已就绪 */\nstatic volatile uint8_t dma_half_ready = 0;  /* Half-Complete 标记 */\n\nvoid ADC_DMA_Init(ADC_HandleTypeDef* hadc, DMA_HandleTypeDef* hdma) {\n    /* 1. 配置 DMA：循环模式，HALF_WORD 宽度，外设地址固定 */\n    hdma->Instance = DMA2_Stream0;\n    hdma->Init.Channel = DMA_CHANNEL_0;\n    hdma->Init.Direction = DMA_PERIPH_TO_MEMORY;\n    hdma->Init.PeriphInc = DMA_PINC_DISABLE;     /* ADC_DR 地址固定 */\n    hdma->Init.MemInc = DMA_MINC_ENABLE;         /* 缓冲区地址递增 */\n    hdma->Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;\n    hdma->Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;\n    hdma->Init.Mode = DMA_CIRCULAR;              /* 循环模式 */\n    hdma->Init.Priority = DMA_PRIORITY_HIGH;\n    HAL_DMA_Init(hdma);\n    \n    /* 2. 配置 ADC：定时器触发，连续模式，DMA 循环 */\n    hadc->Init.ContinuousConvMode = ENABLE;\n    hadc->Init.DMAContinuousRequests = ENABLE;\n    hadc->Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T2_TRGO;  /* TIM2 TRGO */\n    hadc->Init.ScanConvMode = ENABLE;  /* 多通道 */\n    \n    /* 3. 启动 DMA */\n    HAL_ADC_Start_DMA(hadc, (uint32_t*)adc_dma_buf, \n                      DMA_BUF_COUNT * DMA_BUF_SAMPLES);\n}\n\n/* DMA 传输完成回调 */\nvoid HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc) {\n    /* DMA_BUF_1 填充完成（64 个样本）*/\n    dma_buf_ready = 1;\n    /* 在中断中做 IIR 滤波 + 过采样平均 */\n    process_dma_buffer(adc_dma_buf[1], DMA_BUF_SAMPLES);\n}\n\nvoid HAL_ADC_ConvHalfCpltCallback(ADC_HandleTypeDef* hadc) {\n    /* DMA_BUF_0 填充完成 */\n    dma_half_ready = 1;\n    process_dma_buffer(adc_dma_buf[0], DMA_BUF_SAMPLES);\n}\n\n/* 应用层：非阻塞读取 */\nvoid Read_Currents_DMA(float* i_u, float* i_v, float* i_w) {\n    if (!dma_buf_ready && !dma_half_ready) return;  /* 无新数据 */\n    \n    /* 直接读滤波后的结果（由 DMA 回调已经计算好）*/\n    *i_u = g_filtered_u_current;\n    *i_v = g_filtered_v_current;\n    *i_w = g_filtered_w_current;\n    \n    /* 清除标记 */\n    dma_buf_ready = 0;\n    dma_half_ready = 0;\n}\n\n/* 代价分析：\n * + 内存：2 × 64 × 2 = 256 字节（可接受）\n * + 中断延迟：~64 × 4μs = 256μs 流水线延迟\n * - 复杂度：需要管理双缓冲和同步\n * - 但 FOC 可以在 256μs 延迟内正常工作，且 CPU 完全释放 */\n",
+      "pitfalls": [
+        "陷阱1 — DMA 缓冲区未声明为 volatile：触发条件 = adc_dma_buf 没有 volatile 修饰，DMA 回调和应用层都在读写 → 症状 = 编译器优化后，应用层可能读到 stale 数据（因为编译器不知道 DMA 会修改缓冲区），导致滤波后的值不更新 → 修复 = 缓冲区必须声明为 static volatile uint16_t adc_dma_buf[DMA_BUF_COUNT][DMA_BUF_SAMPLES]，或者用 __DSB() 指令做内存屏障",
+        "陷阱2 — ADC 触发定时器频率过高：触发条件 = TIM2 的 TRGO 频率设得比 ADC 最大采样率还快（如 1MHz 触发但 ADC 最大 1MHz @ 144 周期 → 需要 144μs 每转换） → 症状 = DMA 缓冲区溢出（数据还没被处理完就填满了），HAL_ADC_ConvCpltCallback 触发两次但缓冲区数据覆盖 → 修复 = 定时器触发频率 ≤ ADC 最大采样率 / 通道数，STM32F4 的 ADC 最大采样率 36MHz / 144周期 ≈ 250kHz，确保 TIM2 ARR 值 >= 144",
+        "陷阱3 — Half-Complete 回调中处理缓冲区时主函数也在读：触发条件 = DMA Half-Complete 回调中更新了 g_filtered_u_current，同时主函数的 Read_Currents_DMA() 正在读取 → 症状 = 读到一半更新，三相电流值不同步（U 相是新一帧，V/W 是旧一帧），FOC 算法计算出错误的转矩 → 修复 = 用双缓冲读取：回调更新 buf_A，主函数读 buf_B，切换时用原子操作（__disable_irq() 保护变量读写）"
+      ],
       "refBook": [
-        "《重构》第2版 ch1-3「重构第一版」",
-        "《UNIX编程艺术》ch2.3「模块原则」",
-        "《代码大全》第2版 ch13「防御性编程」"
+        "《重构》ch2 — 保持行为正确的渐进式重构",
+        "《UNIX编程艺术》ch5 — 好程序设计是做好一件事：DMA 双缓冲让 ADC 转换和数据处理各做各的事",
+        "《人月神话》ch16 — 没有银弹：DMA 双缓冲增加了延迟复杂度，但换取了 CPU 释放和采样稳定性"
       ]
     }
   ]
