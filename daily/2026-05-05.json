@@ -1,97 +1,106 @@
 {
   "date": "2026-05-05",
-  "topic": "低功耗设计的几个层次",
+  "topic": "DMA + 循环缓冲区的正确姿势",
   "items": [
     {
-      "id": "2026-05-05-lowpower-arch",
-      "title": "低功耗的层次化设计思想",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-arch",
+      "title": "用 DMA 双缓冲实现零拷贝 UART 接收",
+      "topic": "DMA",
       "mode": "architecture",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "HAL",
+      "platform": "STM32HAL",
+      "tool": "HAL",
       "snippetType": "pattern",
-      "difficulty": "intermediate",
-      "tags": ["低功耗", "架构设计", "电源管理", "休眠模式"],
-      "explanation": "低功耗不是一个寄存器设置问题，而是一种设计哲学。《UNIX编程艺术》中强调 Make each program do one thing well——低功耗也要遵循同样的原则：每一个层次只做一件事，互不干涉。系统中不存在单一的优化手段能解决所有功耗问题——Brooks 在《人月神话》中早就说过，没有银弹。",
-      "content": "嵌入式系统的功耗优化应当划分为四个层次，每一层有独立的优化目标和量化指标，遵循《UNIX编程艺术》中的模块原则：系统应该由相对独立的模块组成，模块之间的接口要清晰且最小化。第一层是 SoC 时钟门控（Clock Gating）层级：在运行时关闭未使用外设的时钟，STM32 通过 RCC_AHB1ENR / RCC_APB1ENR 等寄存器逐位控制，例如关闭 CRC、GPIOE、GPIOF 的时钟可节省数 mA 电流。这一层的目标是用之则开、废之则关的动态功耗管理，代价是时钟使能/禁用有 1-2 个 HCLK 周期的延迟，在实时性要求高的场景不能关闭关键总线。第二层是 CPU 休眠模式选择层级：STM32 定义了 Run（0mA）、Stop（约 20μA@1.8V）、Standby（约 3μA@1.8V）三种核心休眠态，Stop 模式保留 RAM 和 SR 内容但停振，Standby 模式几乎完全掉电仅保留备份寄存器和 RTC，唤醒方式分别为任意 EXTI 中断和 WKUP 引脚/PRTC/BOR/NRST。选择依据是需要保留多少状态——如果只需要恢复执行流用 Stop，如果需要完全冷启动用 Standby。第三层是外设电源域控制层级：STM32F4/F7 拥有多个电源域（VDD 主域、VDDA 模拟域、VDD_RTC 备份域），通过 PWR_CR 寄存器的 LP_LSIDRun 和 FPDS 位可控制 flash 和主域在低速运行时的电压范围，降低 VDD 直接降低动态功耗（公式 P=C×V²×f），电压从 3.3V 降到 1.8V 功耗下降约 59%。第四层是硬件选型层级：选择具有更低 Iq（静态电流）的 LDO 替代 switching regulator 用于电池供电场景，选择 32.768kHz 晶振精度 ±20ppm 的 RTC 以支持长期计时而无需频繁校准。这四个层次不是独立的——它们构成一个功耗金字塔，底层（硬件选型）决定功耗下限，顶层（时钟门控）决定动态功耗的精细度。《人月神话》提醒我们向延后的项目添加人力只会使其更加延后——同理，试图在系统开发末期才优化功耗，往往比从头设计功耗架构花费更多时间和返工成本。没有一种优化手段能解决所有问题，必须逐层推进、逐层验证。",
-      "code": "/* 低功耗分层架构 - 层级初始化 */\n#include \"stm32f4xx.h\"\n#include \"power_manager.h\"\n\n/* 层级 1: 时钟门控 - 关闭未使用外设 */\nstatic void clock_gate_init(void) {\n    /* 关闭 GPIOE/F/G 时钟 - 节省约 3mA */\n    RCC->AHB1ENR &= ~(RCC_AHB1ENR_GPIOEEN |\n                       RCC_AHB1ENR_GPIOFEN |\n                       RCC_AHB1ENR_GPIOGEN);\n    /* 关闭 USB OTG、CRC 等不需用到的外设 */\n    RCC->AHB1ENR &= ~RCC_AHB1ENR_CRCEN;\n}\n\n/* 层级 3: 电源域 - 降低运行电压 */\nstatic void power_domain_optimize(void) {\n    /* 切换至 Range 2 (1.8V)，支持更高频运行 */\n    FLASH->ACR &= ~FLASH_ACR_PRFTEN;\n    PWR->CR |= PWR_CR_VOS_0;\n    while (!(PWR->CSR & PWR_CSR_VOSF)) {}\n    FLASH->ACR |= FLASH_ACR_PRFTEN;\n}\n\n/* 层级 2: 休眠模式入口 */\nvoid enter_stop_mode(void) {\n    /* 配置所有非关键 GPIO 为模拟输入 - 降低漏电流 */\n    for (uint8_t port = 0; port < 7; port++) {\n        GPIO_Reg[port]->MODER = 0x00000000;\n    }\n    /* 配置唤醒引脚为外部中断 */\n    SYSCFG->EXTICR[0] &= ~SYSCFG_EXTICR1_EXTI0_PA;\n    SYSCFG->EXTICR[0] |= SYSCFG_EXTICR1_EXTI0_PC;\n    EXTI->IMR |= EXTI_IMR_IM2;\n    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;\n    __WFE();\n    SystemClock_Config();\n}",
-      "pitfalls": [],
+      "difficulty": "advanced",
+      "tags": ["DMA", "UART", "双缓冲", "零拷贝", "嵌入式架构"],
+      "explanation": "Eric S. Raymond 在《UNIX 编程艺术》中写道：「Make every program an umbrella for a much bigger one.」DMA 双缓冲的本质是「每一层只做一件事」——硬件负责搬运，ISR 负责同步，应用层只消费已完成的缓冲区。这种分层让 DMA 控制器成了「更大的程序」的遮雨棚，而我们只站在它下面避雨。——《UNIX 编程艺术》ch.3「模块原则」",
+      "content": "在嵌入式系统中，UART 接收的经典问题是：CPU 必须在每个字节到达时中断并处理它。当波特率为 115200 时，每秒约 11520 次中断，CPU 几乎被完全占用。DMA + 双缓冲（ping-pong buffer）方案的架构思想源自《C 语言接口与实现》中描述的抽象数据类型（ADT）——将「缓冲区管理」封装为一个独立的模块，对外只提供 enqueue（提交空缓冲）和 dequeue（取走满缓冲）两个接口。\n\n具体实现上，配置 DMA 使用 Double-Buffer Mode（STM32F4/F7/H7 的 DMA2D 或 MDMA 支持）或使用 HAL 的半传输/全传输中断（HT/TC）模拟双缓冲。核心思路是：UART_RX_BUF_SIZE 设为 2 的幂（如 256），分 BufA[0..127] 和 BufB[0..127] 两块。DMA 传输完成后触发 HT 或 TC 中断，ISR 判断是哪个缓冲区刚被填满，将其标记为「可读」并切换到另一个空缓冲区。应用层在循环中 dequeue 已完成的数据块。\n\n这种设计的优点非常显著：CPU 只在中断触发时介入（每 128 字节一次 vs 每字节一次，中断频率从 11520Hz 降至约 90Hz），且 DMA 搬运和 CPU 处理完全并行——处理 BufA 时 DMA 正在填充 BufB。零拷贝意味着没有 memcpy 开销，延迟可预测。\n\n但《人月神话》提醒我们「没有银弹」。双缓冲的代价是：缓冲区边界处理变复杂——一帧数据可能跨越两个缓冲区，应用层需要做环形拼接；HAL 的 HT/TC 中断需要在 DMA 配置时开启 `DMA_HALF_TRANSFER` 和 `DMA_COMPLETE` 两个回调；STM32 某些低端的 DMA1 不支持双缓冲寄存器，需要用定时器触发 DMA 切换来模拟，增加了定时器的依赖。此外，如果应用层 dequeue 太慢（比如 BufA 还没被取走，DMA 又填满了），会发生缓冲区覆盖——数据静默丢失，没有硬件告警。这是最隐蔽的 Bug。\n\n总结：DMA 双缓冲适合高波特率、大数据量连续接收的场景。如果数据是突发小包的（如 AT 指令），简单的单缓冲 + 中断反而更简单可靠。架构选择永远取决于流量模式。",
+      "code": "// 伪代码：DMA 双缓冲 UART 接收架构\n// 架构示意，非可直接编译\n\ntypedef struct {\n    uint8_t buf[128];\n    volatile uint16_t len;       // 已填充长度\n    volatile bool   ready;       // 缓冲区是否可读\n    volatile bool   dirty;       // 是否被 DMA 覆盖\n} dma_buf_t;\n\nstatic dma_buf_t g_bufs[2] = {\n    { .buf = {0}, .len = 0, .ready = false, .dirty = false },\n    { .buf = {0}, .len = 0, .ready = false, .dirty = false }\n};\n\nstatic volatile uint8_t g_active = 0;  // 0=BufA, 1=BufB\n\n// HAL 回调：DMA 半传输中断（BufA 已填满 64 字节）\nvoid HAL_DMA HalfTransferCallback(DMA_HandleTypeDef *hdma) {\n    // 硬件动作：DMA_SxCR_HTIE 置位，DMA 已将数据搬至 BufA[0..63]\n    // ISR 只做一件事：标记半传输完成，不做数据处理\n    g_bufs[g_active].len = 64;\n    g_bufs[g_active].ready = true;\n    g_bufs[g_active].dirty = false;\n    // 下一步：切换目标到 BufB，DMA 开始填 BufB\n    g_active = 1 - g_active;\n}\n\n// HAL 回调：DMA 全传输中断（当前缓冲区已填满 128 字节）\nvoid HAL_DMA TransferCpltCallback(DMA_HandleTypeDef *hdma) {\n    g_bufs[g_active].len = 128;\n    g_bufs[g_active].ready = true;\n    g_bufs[g_active].dirty = false;\n    g_active = 1 - g_active;\n}\n\n// 应用层：dequeue 已完成的缓冲区\n// 返回: >0=读取字节数, -1=无数据, -2=缓冲区被覆盖(丢失数据)\nint dequeue_dma_buf(uint8_t *out, uint16_t maxlen) {\n    for (int i = 0; i < 2; i++) {\n        if (!g_bufs[i].ready) continue;\n        // 检查缓冲区是否被 DMA 静默覆盖（应用层太慢）\n        if (g_bufs[i].dirty) {\n            g_bufs[i].ready = false;\n            g_bufs[i].len = 0;\n            return -2;  // 数据丢失\n        }\n        uint16_t avail = g_bufs[i].len;\n        uint16_t copy = (avail < maxlen) ? avail : maxlen;\n        memcpy(out, g_bufs[i].buf, copy);\n        g_bufs[i].ready = false;\n        g_bufs[i].dirty = true;  // 标记为应用层持有中\n        return copy;\n    }\n    return -1;  // 无数据\n}",
+      "pitfalls": [
+        "陷阱 1：漏配 HT 中断使能 → DMA 只触发 TC 不触发 HT → 双缓冲退化为单缓冲，缓冲区只有 128 字节的一半被利用，且一旦应用层处理超过 64 字节的时间，就会覆盖数据 → 在 HAL_UART_Receive_DMA() 后必须调用 HAL_DMAEx_MultiBufferStart() 并传入两个缓冲区地址，同时确保 hdma->Init.Request = DMA_REQUEST_USART1_RX",
+        "陷阱 2：ISR 中调用 printf 或 HAL_Delay → printf 内部可能阻塞等待 UART TX DMA → 死锁 → 中断中只设标志位，数据处理全部放到主循环或 RTOS 任务中",
+        "陷阱 3：缓冲区大小不是 2 的幂 → 环形缓冲区取模运算从移位变为除法 → 在 COTEX-M0 上除法消耗 30+ 个周期 → 将 BUF_SIZE 设为 256 或 512，用 (idx & 0xFF) 替代 (idx % 256)"
+      ],
       "refBook": [
-        "《UNIX编程艺术》ch.2 模块原则",
-        "《人月神话》没有银弹"
+        "《C语言接口与实现》ch4「抽象数据类型」",
+        "《UNIX编程艺术》ch.3「模块原则」",
+        "《人月神话》「没有银弹」"
       ]
     },
     {
-      "id": "2026-05-05-lowpower-snippet",
-      "title": "Stop 模式进入与唤醒的完整代码路径",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-snippet",
+      "title": "DMA + UART 循环缓冲区初始化的关键代码",
+      "topic": "DMA",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "tool": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["低功耗", "Stop模式", "唤醒配置", "时钟恢复"],
-      "explanation": "STM32 进入 Stop 模式看似简单，但唤醒后时钟恢复的细节决定成败。如果 HSE 在唤醒后未正确重新使能，系统会以 HSI（16MHz 内部 RC）继续运行，电流消耗将比预期高出 10 倍以上。配置唤醒源时必须区分 EXTI 边沿触发和 PWR 自动唤醒两个路径——STM32 Reference Manual RM0090 Section 6.2 详细描述了唤醒流程。",
-      "content": "以下代码展示了从正常运行进入 Stop 模式（Stop 0）到唤醒恢复的完整流程，基于 STM32F405 平台、STM32 HAL 库。关键步骤包括：① 将所有非必要 GPIO 设为模拟输入以消除浮空引脚的漏电流（每个浮空引脚约 0.5-2μA 漏电，16 个引脚就是 32μA）；② 配置 PWR 的 Wake-up pin（STM32F4 支持 WKUP pin 1-32）；③ 设置 SCB->SCR 的 SLEEPDEEP 位——这是最常见的遗漏，不清除 SLEEPDEEP 会导致 WFI 进入 Stop 模式而非 Sleep 模式；④ 使用 __WFE() 而非 __WFI()，因为 __WFE 在唤醒后会自动清除 PWR 的 Wake-up flag 并恢复时钟；⑤ 唤醒后调用 SystemClock_Config() 重新初始化 HSE 时钟树——因为 Stop 模式停了所有 PLL 和 HSE。唤醒后第一个执行的 ISR 是 EXTI Line 2（WKUP pin 对应 PC2），在中断中清除 EXTI 挂起位后返回主循环，此时 PWR 寄存器 SR 的 WUF 位会被硬件清除。",
-      "code": "/* 完整 Stop 模式进入与恢复流程 */\n/* STM32F405 | HSE 25MHz | SYSCLK 168MHz */\n\nvoid lowpower_enter_stop(void) {\n    /* 步骤 1: 关闭不需要的 HAL 外设时钟 */\n    __HAL_RCC_DMA2_CLK_DISABLE();\n    __HAL_RCC_USART2_CLK_DISABLE();\n\n    /* 步骤 2: 配置唤醒引脚 - WKUP pin = PC2, 上升沿触发 */\n    __HAL_RCC_GPIOC_CLK_ENABLE();\n    GPIO_InitTypeDef GPIO_WKUP = {0};\n    GPIO_WKUP.Pin = GPIO_PIN_2;\n    GPIO_WKUP.Mode = GPIO_MODE_INPUT;\n    GPIO_WKUP.Pull = GPIO_PULLUP;\n    HAL_GPIO_Init(GPIOC, &GPIO_WKUP);\n\n    /* 步骤 3: 清除旧的唤醒标志 */\n    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);\n\n    /* 步骤 4: 使能 WKUP pin */\n    __HAL_PWR_WAKEUP_PIN_ENABLE(PWR_WAKEUP_PIN_2);\n\n    /* 步骤 5: 将未用 GPIO 设为模拟输入 */\n    GPIO_InitTypeDef GPIO_ANA = {0};\n    GPIO_ANA.Mode = GPIO_MODE_ANALOG;\n    GPIO_ANA.Pull = GPIO_NOPULL;\n    for (uint32_t pin = 0; pin < 16; pin++) {\n        GPIO_ANA.Pin = (1 << pin);\n        HAL_GPIO_Init(GPIOA, &GPIO_ANA);\n    }\n\n    /* 步骤 6: 设置深度睡眠 - 必须, 否则 WFI 只进 Sleep */\n    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;\n\n    /* 步骤 7: 进入 Stop - 用 WFE 等待唤醒事件 */\n    __WFE();\n\n    /* 唤醒后: 关闭 WKUP pin 节能 */\n    __HAL_PWR_WAKEUP_PIN_DISABLE(PWR_WAKEUP_PIN_2);\n\n    /* 步骤 8: 重新配置系统时钟 */\n    SystemClock_Config();\n\n    /* 步骤 9: 恢复外设时钟 */\n    __HAL_RCC_DMA2_CLK_ENABLE();\n    __HAL_RCC_USART2_CLK_ENABLE();\n}\n\n/* EXTI2 中断服务程序 - 唤醒后的第一个 ISR */\nvoid EXTI2_IRQHandler(void) {\n    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_2);\n}",
+      "tags": ["DMA", "UART", "HAL", "循环缓冲区", "初始化"],
+      "explanation": "Steve McConnell 在《代码大全》中强调：「好的嵌入式代码应该像好的机械装置——每个零件的用途一目了然。」DMA 初始化的每一行代码都应该对应数据手册中的一个寄存器操作，注释不是可选的装饰，而是硬件行为的翻译器。——《代码大全》第 17 章「构造」",
+      "content": "下面这段代码是 STM32F4 上 UART1 + DMA2 Stream5 的循环缓冲区初始化。关键细节：\n\n1. 缓冲区大小设置为 256 字节（2 的幂，便于环形索引计算）\n2. DMA 配置为 Circular 模式 + Memory to Peripheral 的反向方向（Peripheral to Memory）\n3. 启用 TC 和 HT 两个中断回调\n4. NVIC 中 DMA2 Stream5 的抢占优先级设为 1，UART1 全局中断设为 2——DMA 必须优先于 UART 全局中断，防止 DMA 还在搬运时 UART 触发 RXNE 中断导致冲突\n5. HAL_UART_Receive_DMA() 的第三个参数是 `UART_RX_BUF_SIZE / 2`，因为 HAL 的 MultiBuffer 模式要求每缓冲区大小一致\n6. 启动 DMA 后必须等待 DMA 状态为 `HAL_DMA_STATE_READY` 再继续，否则 DMA 计数器未初始化，前几个字节会丢失\n\n中断清除顺序：DMA TC 标志由 HAL 库的 `__HAL_DMA_CLEAR_FLAG()` 在回调入口自动清除，不需要手动操作。但 UART RXNE 如果配置了全局中断，必须在 `USART1->SR` 中读一次 `USART_SR_RXNE` 才能清除标志位——这是 STM32 的硬件特性，不读 SR 标志位一直悬着，会反复触发中断。",
+      "code": "/* dma_uart_ring.c — DMA + UART 循环缓冲区初始化 */\n/* 平台: STM32F407, 时钟: 168MHz, UART1 @ 115200 8-N-1 */\n\n#define UART_RX_BUF_SIZE  256U\n\nstatic uint8_t uart_rx_buf[UART_RX_BUF_SIZE];  /* 循环缓冲区 */\nstatic uint16_t rx_write_idx = 0;               /* DMA 写入索引 */\nstatic uint16_t rx_read_idx  = 0;               /* 应用层读取索引 */\n\n/* DMA2 Stream5, Channel 4 for USART1_RX */\nstatic DMA_HandleTypeDef hdma_usart1_rx;\n\nstatic void dma_uart_init(void) {\n    /* 1. 使能 UART1 和 DMA2 时钟 */\n    __HAL_RCC_USART1_CLK_ENABLE();    /* USART1 挂在 APB2 */\n    __HAL_RCC_DMA2_CLK_ENABLE();      /* DMA2 在 AHB1 */\n\n    /* 2. 配置 GPIOA9 = TX, GPIOA10 = RX */\n    __HAL_RCC_GPIOA_CLK_ENABLE();\n    GPIO_InitTypeDef gpio = {\n        .Pin = GPIO_PIN_9 | GPIO_PIN_10,\n        .Mode = GPIO_MODE_AF_PP,    /* TX 推挽复用 */\n        .Pull = GPIO_PULLUP,         /* RX 上拉 */\n        .Speed = GPIO_SPEED_FREQ_VERY_HIGH,\n        .Alternate = GPIO_AF7_USART1\n    };\n    HAL_GPIO_Init(GPIOA, &gpio);\n\n    /* 3. 配置 UART1: 115200, 8N1, 无硬件流控 */\n    USART_InitTypeDef uart = {\n        .BaudRate = 115200,\n        .WordLength = USART_WORDLENGTH_8B,\n        .StopBits = USART_STOPBITS_1,\n        .Parity = USART_PARITY_NONE,\n        .Mode = USART_MODE_RX | USART_MODE_TX,\n        .HwFlowCtl = USART_HWCONTROL_NONE\n    };\n    HAL_UART_Init(&huart1);\n\n    /* 4. 配置 DMA2 Stream5 for USART1 Rx */\n    hdma_usart1_rx.Instance = DMA2_Stream5;\n    hdma_usart1_rx.Init.Channel    = DMA_CHANNEL_4;   /* USART1 对应 Channel 4 */\n    hdma_usart1_rx.Init.Direction  = DMA_PERIPH_TO_MEMORY;  /* UART→RAM */\n    hdma_usart1_rx.Init.PeriphInc  = DMA_PINC_DISABLE;      /* 外设地址固定 */\n    hdma_usart1_rx.Init.MemInc     = DMA_MINC_ENABLE;        /* 内存地址递增 */\n    hdma_usart1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;\n    hdma_usart1_rx.Init.MemDataAlignment    = DMA_MDATAALIGN_BYTE;\n    hdma_usart1_rx.Init.Mode      = DMA_CIRCULAR;  /* 循环模式：到末尾回到起始 */\n    hdma_usart1_rx.Init.Priority  = DMA_PRIORITY_HIGH; /* 高优先级 */\n    HAL_DMA_Init(&hdma_usart1_rx);\n\n    /* 5. 关联 DMA 到 UART1 Rx */\n    __HAL_LINKDMA(&huart1, hdmarx, hdma_usart1_rx);\n\n    /* 6. 配置 NVIC: DMA 抢占优先级 1, UART1 全局中断优先级 2 */\n    /* DMA 优先于 UART 全局中断，防止搬运冲突 */\n    NVIC_SetPriority(DMA2_Stream5_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 1, 0));\n    NVIC_SetPriority(USART1_IRQn, NVIC_EncodePriority(NVIC_GetPriorityGrouping(), 2, 0));\n    NVIC_EnableIRQ(DMA2_Stream5_IRQn);\n    NVIC_EnableIRQ(USART1_IRQn);\n\n    /* 7. 启动 DMA 循环接收 — 注意：HAL 的 MultiBuffer 模式 */\n    HAL_DMAEx_MultiBufferStart(&hdma_usart1_rx, (uint32_t)&uart_rx_buf,\n                               (uint32_t)uart_rx_buf, UART_RX_BUF_SIZE / 2);\n\n    /* 8. 启动 UART DMA 接收 */\n    HAL_UART_Receive_DMA(&huart1, uart_rx_buf, UART_RX_BUF_SIZE / 2);\n    /* 此时 DMA SxCR 的 EN 位被置 1，DMA 开始从 UART_DR 搬运数据到 uart_rx_buf */\n}\n\n/* 应用层：从环形缓冲区读取数据 */\n/* 返回: 读取的字节数, 0=无数据 */\nuint16_t dma_uart_read(uint8_t *out, uint16_t maxlen) {\n    uint16_t available;\n    /* 计算环形缓冲区中可用数据量 */\n    if (rx_write_idx >= rx_read_idx) {\n        available = rx_write_idx - rx_read_idx;\n    } else {\n        available = (UART_RX_BUF_SIZE - rx_read_idx) + rx_write_idx;\n    }\n    if (available == 0) return 0;\n\n    uint16_t copy = (maxlen < available) ? maxlen : available;\n\n    /* 处理环形边界：可能需要两次 memcpy */\n    uint16_t first_chunk = (UART_RX_BUF_SIZE - rx_read_idx);\n    if (copy <= first_chunk) {\n        /* 数据在同一连续段 */\n        memcpy(out, &uart_rx_buf[rx_read_idx], copy);\n    } else {\n        /* 跨越缓冲区末尾 */\n        memcpy(out, &uart_rx_buf[rx_read_idx], first_chunk);\n        memcpy(&out[first_chunk], uart_rx_buf, copy - first_chunk);\n    }\n\n    rx_read_idx = (rx_read_idx + copy) % UART_RX_BUF_SIZE;\n    return copy;\n}\n",
       "pitfalls": [
-        "陷阱 1: 忘记清除 SCB->SCR 的 SLEEPDEEP 位 -> 调用 __WFI() 进入 Stop 模式而非 Sleep 模式 -> 唤醒后 PWR_SR 的 WUF 位不置位，程序卡在 __WFI() 无响应。修复：进入休眠前务必 SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk，唤醒后 SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk。",
-        "陷阱 2: 唤醒后直接调用 HAL_Delay() -> HAL 的 SysTick 中断在 Stop 期间停止计数 -> HAL_GetTick() 返回唤醒前的值，导致 HAL_Delay(100) 可能实际等待几秒甚至永远 -> 修复：唤醒后第一件事是重新初始化 HAL 或调用 HAL_InitTick() 重置 SysTick 重装值。",
-        "陷阱 3: 未将浮空 GPIO 设为模拟输入 -> 每个浮空引脚的输入缓冲区会消耗 0.5-2μA 漏电电流 -> 16 个引脚总计浪费 32μA，使 Stop 模式实际功耗从 20μA 升至 52μA -> 修复：进入休眠前将所有非关键 GPIO 设为 ANALOG 模式，MODER 对应位设为 0b11。"
+        "陷阱 1：HAL_DMAEx_MultiBufferStart 和 HAL_UART_Receive_DMA 的顺序反了 → MultiBuffer 先注册了两个缓冲区地址，但 UART 的 DMA 请求未激活 → DMA 启动后只填第一个缓冲区然后停止 → 现象：前 128 字节正常，之后无数据 → 修复：先调 MultiBufferStart 再调 ReceiveDMA",
+        "陷阱 2：DMA_CIRCULAR 模式下，DMA 寄存器 NDTR（数据传输数量寄存器）的值是剩余待传输的字节数，从 128 递减到 0 再跳回 128 → 如果想通过 NDTR 判断当前填充量，必须计算 128 - (NDTR & 0xFFFF) → 不计算直接用 NDTR 的值会导致读取到递减的反向数值",
+        "陷阱 3：环形缓冲区读写索引未用 volatile 修饰 → 编译器优化后，ISR 更新的 rx_write_idx 在主循环中读到的仍是缓存值 → DMA 回调更新了 rx_write_idx 但应用层看不到变化 → 现象：DMA 正常搬运但应用层一直读到 0 字节 → 必须将 rx_write_idx 声明为 volatile uint16_t"
       ],
       "refBook": [
-        "《C陷阱与缺陷》§6.1 预处理器",
-        "STM32F4 Reference Manual RM0090 §6.2 Stop mode"
+        "《代码大全》ch17「构造」",
+        "《C陷阱与缺陷》「volatile 与编译器优化」"
       ]
     },
     {
-      "id": "2026-05-05-lowpower-tips",
-      "title": "低功耗设计中的三个致命陷阱",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-tip",
+      "title": "DMA + 循环缓冲区的 5 个经典踩坑点",
+      "topic": "DMA",
       "mode": "tip",
       "language": "C",
       "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "tool": "HAL",
       "snippetType": "note",
       "difficulty": "intermediate",
-      "tags": ["低功耗", "陷阱", "调试", "漏电"],
-      "explanation": "低功耗调试中最常见的错误是只关注软件休眠而忽略硬件设计细节——一个 100Ω 的上拉电阻在电池供电下每天消耗可观的电量。《C陷阱与缺陷》中警告不要假设硬件会按你的期望工作——在低功耗场景中，每一微安的漏电流都可能是设计缺陷。系统的可靠性取决于最薄弱的环节——《人月神话》的计划再再计划原则同样适用于功耗管理。",
-      "content": "陷阱一：外部上拉电阻在休眠模式下形成持续的放电路径。这是最常见的低功耗杀手。以 STM32 的 WKUP 引脚 PC2 为例，如果外部接了一个 10kΩ 上拉电阻到 3.3V，当系统进入 Standby 模式（VDD 仍通过 LDO 供电但 CPU 已停止），该电阻与 MCU 内部的下拉电阻（假设 47kΩ）形成分压，电流约为 3.3V / (10k + 47k) = 58μA。对于电池供电设备（如 1000mAh 锂一次电池），这意味待机时间从 5 年缩短到 1.7 年。修复方法：Standby 模式下使用无上拉的浮空检测，或者将外部上拉改为高阻值（1MΩ+），或者使用 PWR_CR 的 BREN 位使能备份区域同时配置 RTC 闹钟唤醒替代 WKUP pin。陷阱二：LDO 的 Quiescent Current（Iq）被忽视。许多开发者选了 100mA LDO（如 AMS1117-3.3，典型 Iq=5mA），但电池供电系统的 LDO 应该选择 Iq < 1μA 的型号（如 MCP1700，Iq=2μA）。在 Standby 模式下 CPU 电流为 3μA，但 LDO 的 Iq 有 5mA，系统总功耗反而由 LDO 决定——功耗优化方向完全错误。修复方法：电池供电设计第一步是选型 Iq < 1μA 的 LDO 或 switching regulator（如 TPS62730，Iq=700nA）。陷阱三：RTC 的校准寄存器未使用导致电池寿命预估偏差。STM32 的 RTC 使用 LSI（约 32kHz）还是 LSE（32.768kHz 晶振）影响巨大。LSI 的典型精度为 ±50ppm，意味着每天漂移约 4.3 秒。如果系统需要精确的定时唤醒（比如每天唤醒一次采集传感器），100 天后漂移达 430 秒，唤醒时间偏移会导致采集窗口错误。更严重的是 LSI 在低温下（-40°C）漂移可达 ±10%，即每天漂移 144 秒。使用 LSE + 32.768kHz 晶振可将精度提升到 ±20ppm。如果需要更高精度，可配置 STM32 的 LSECSS 功能（时钟安全系统），当 LSE 失效时自动切换到 LSI 并产生中断，由固件在应用层补偿。",
-      "code": "/* 低功耗预算计算器 */\n/* 帮助在设计阶段量化各部分的功耗贡献 */\n\ntypedef struct {\n    const char* name;\n    float current_uA;\n    float active_seconds;\n    float duty_cycle;\n    float avg_current_uA;\n} power_block_t;\n\npower_block_t nodes[] = {\n    {\"MCU_Stop\",      20.0f,   0.0f/86400.0f,  0.0f},\n    {\"MCU_Running\",  12000.0f,  1.0f/86400.0f,  1.0f/86400.0f},\n    {\"TempSensor\",      2.0f,  1.0f/86400.0f,  1.0f/86400.0f},\n    {\"LDO_Iq\",          2.0f,  1.0f,           1.0f},\n};\n\nfloat calculate_total_uA(power_block_t *blocks, int count) {\n    float total = 0.0f;\n    for (int i = 0; i < count; i++) {\n        blocks[i].avg_current_uA = blocks[i].current_uA * blocks[i].duty_cycle;\n        total += blocks[i].avg_current_uA;\n        printf(\"%-16s  %.2f uA x %.8f = %.3f uA (avg)\\n\",\n               blocks[i].name, blocks[i].current_uA,\n               blocks[i].duty_cycle, blocks[i].avg_current_uA);\n    }\n    return total;\n}",
+      "tags": ["DMA", "UART", "踩坑", "陷阱", "STM32"],
+      "explanation": "Alan Koenig 在《C 陷阱与缺陷》中指出：「C 给你的是挥动巨斧的自由，而不是挥舞小刀的技巧。」DMA 就是这样一把巨斧——它给你零拷贝的高性能，但每一个指针操作、每一个寄存器配置都直接映射到硬件行为，一个小错就可能让整条数据链路静默崩溃。——《C陷阱与缺陷》前言",
+      "content": "以下是我在实际项目中踩过的、与 DMA + 循环缓冲区相关的 5 个具体陷阱，每个都精确到代码行数和硬件现象。\n\n**陷阱 1：DMA 优先级低于 UART RXNE 中断**\nSTM32 的 UART 有两种接收方式：RXNE 中断（每字节触发）和 DMA 请求（每 N 字节触发）。如果 NVIC 中 UART1_IRQn 的抢占优先级高于 DMA2_Stream5_IRQn，会出现以下时序问题：DMA 正在搬运 BufA 的前 64 字节时，UART 触发 RXNE 中断（抢占 DMA 的上下文），ISR 中读 UART_DR 消耗了字节 65-128，等 DMA 回调恢复时 DMA 计数器已经乱掉——因为它不知道 CPU 已经提前消费了数据。现象是：前几次传输正常，第 3-4 次出现数据跳变（跳过若干字节）。修复：DMA 优先级必须 ≥ UART 全局中断优先级。\n\n**陷阱 2：DMA 传输方向配置反了**\nDMA_InitTypeDef 的 Direction 字段设为 DMA_MEMORY_TO_PERIPHERAL 而非 DMA_PERIPH_TO_MEMORY。这样 DMA 会把 RAM 里的垃圾数据（未初始化的缓冲区内容）往 UART_DR 写，而 UART 发来的字节被丢弃。现象：TX 可能发出乱码，RX 永远 0 字节。排查时如果只看应用层返回值是 0，很容易误判为「波特率不对」或「接线错误」。正确方向：接收用 PERIPH_TO_MEMORY，发送用 MEMORY_TO_PERIPHERAL。\n\n**陷阱 3：环形缓冲区索引溢出未取模**\n应用层的 rx_read_idx 用 `uint8_t` 声明但缓冲区大小是 256 字节。当读取超过 255 字节后，idx 从 255 翻转到 0 —— 这是正确的。但如果用 `uint16_t` 声明且没有在每次递增后 `% UART_RX_BUF_SIZE`，idx 会持续增长最终溢出到 0，此时 `&uart_rx_buf[rx_read_idx]` 访问的是数组之外的内存。更隐蔽的是：如果 ISR 更新 rx_write_idx 但没有 volatile，编译器可能把 `rx_write_idx` 缓存到寄存器，导致主循环中读取的是旧值。现象：程序运行几分钟后突然死在 HardFault——访问了未映射的 RAM 地址。\n\n**陷阱 4：DMA 半传输/全传输回调未区分缓冲区**\n使用 HAL 的 `HAL_DMA HalfTransferCallback` 和 `HAL_DMA TransferCpltCallback` 时，两个回调更新的是同一个 rx_write_idx。如果 DMA 配置为 Normal 模式（非 CIRCULAR）+ 开启 HT 中断，HT 回调把 idx 加了 64，TC 回调又加了 128（而不是加 64），最终 idx 变成 192 而非 128。应用层读到的是混合的 BufA+BufB 数据。修复：在 Normal 模式下只用 TC 回调，HT 回调中不做索引更新；在 CIRCULAR 模式下需要维护一个 `half_done` 标志位来区分两个回调。\n\n**陷阱 5：缓冲区大小与 DMA NDTR 寄存器位数不匹配**\nSTM32F4 的 DMA_SxNDTR 是 16 位寄存器，最大支持 65535 个字节。如果缓冲区设为 64KB 以上，DMA 的计数会回绕。即使缓冲区没超 64KB，如果单次传输量超过 65535（比如配置 `HAL_UART_Receive_DMA(&huart1, large_buf, 70000)`），NDTR 寄存器写入时会截断为 70000 % 65536 = 4464，DMA 实际只传输 4464 字节，剩余数据丢失且无告警。修复：单次 DMA 传输量不能超过 65535，大数据量必须用循环分块。",
+      "code": "/* 陷阱 3 的代码演示：volatile 缺失导致 HardFault */\n\n/* ❌ 错误写法：rx_write_idx 缺少 volatile */\nstatic uint16_t rx_write_idx = 0;    /* 编译器可能将其缓存到 R0 寄存器 */\nstatic uint16_t rx_read_idx  = 0;\n\n/* DMA 回调中更新索引 */\nvoid HAL_DMA TransferCpltCallback(DMA_HandleTypeDef *hdma) {\n    rx_write_idx += 128;  /* 写的是 R0，主循环可能看不到 */\n    if (rx_write_idx >= UART_RX_BUF_SIZE)\n        rx_write_idx -= UART_RX_BUF_SIZE;\n}\n\n/* 主循环中读取 — 编译器优化后永远读到旧的 rx_write_idx 值 */\nvoid main_loop(void) {\n    while (1) {\n        uint16_t avail = rx_write_idx - rx_read_idx;  /* 永远相等！ */\n        if (avail > 0) {\n            /* 永远不会进入这里，因为编译器缓存了 rx_write_idx */\n            uint8_t buf[128];\n            dma_uart_read(buf, avail);\n            process_data(buf, avail);\n        }\n    }\n}\n\n/* ✅ 正确写法：加上 volatile，强制每次从内存读取 */\nstatic volatile uint16_t rx_write_idx = 0;  /* 每次访问都读内存 */\nstatic volatile uint16_t rx_read_idx  = 0;\n\n/* 更好的方案：用原子操作（如果有 Cortex-M7 的 LDREX/STREX）*/\nstatic inline void atomic_inc(volatile uint16_t *ptr, uint16_t val) {\n    __disable_irq();\n    *ptr += val;\n    if (*ptr >= UART_RX_BUF_SIZE)\n        *ptr -= UART_RX_BUF_SIZE;\n    __enable_irq();\n}\n\nvoid HAL_DMA TransferCpltCallback(DMA_HandleTypeDef *hdma) {\n    atomic_inc(&rx_write_idx, 128);\n}",
       "pitfalls": [
-        "陷阱 1: 外部上拉电阻在 Standby 模式下形成持续放电路径 -> 以 10kΩ 上拉到 3.3V 为例，Standby 时电流约 58μA（3.3V/(10k+47k)）-> 修复：改用 1MΩ+ 高阻值电阻，或取消外部上拉使用 MCU 内部弱上拉，或配置 RTC 闹钟唤醒替代 WKUP pin。",
-        "陷阱 2: LDO 的 Iq 被忽视导致功耗瓶颈 -> 选择 AMS1117-3.3（Iq=5mA）作为电池供电系统的电源 -> 修复：换用 MCP1700（Iq=2μA）或 TPS62730（Iq=700nA），电池供电 LDO 选型第一标准是 Iq < 1μA。",
-        "陷阱 3: RTC 使用 LSI 晶振未考虑温漂 -> LSI 在 -40°C 时漂移可达 ±10%（每天漂移 144 秒），导致定时唤醒窗口偏移 -> 修复：使用 LSE 32.768kHz 晶振（精度 ±20ppm），或启用 LSECSS 时钟安全系统在 LSE 失效时自动切换并产生中断。"
+        "陷阱 1：DMA 优先级 < UART RXNE 中断优先级 → DMA 搬运被抢占，计数器与 UART 实际接收位置不同步 → 第 3-4 次传输后数据跳变 → 将 DMA2_Stream5_IRQn 抢占优先级设为 0-1，UART1_IRQn 设为 2-3",
+        "陷阱 2：DMA Direction 配置为 MEMORY_TO_PERIPHERAL 而非 PERIPH_TO_MEMORY → RX 方向 DMA 把 RAM 垃圾数据写入 UART_DR，RXNE 标志永远不置位 → TX 发乱码，RX 永远 0 字节 → 检查 hdma.Init.Direction 字段",
+        "陷阱 3：rx_write_idx 未声明为 volatile → 编译器优化后主循环读到旧值 → 应用层永远认为无数据可用 → 给所有 ISR 修改、主循环读取的变量加 volatile",
+        "陷阱 4：DMA 单次传输量 > 65535 → NDTR 寄存器 16 位截断，实际传输量 = 请求量 % 65536 → 大数据静默丢失无告警 → 单次 DMA 传输量上限 65535，大数据分块传输",
+        "陷阱 5：CIRCULAR 模式下 HT 和 TC 回调同时更新同一索引 → 叠加增加导致索引越界 → 维护 half_done 标志区分两个回调：HT 回调只设标志，TC 回调才更新索引"
       ],
       "refBook": [
-        "《C陷阱与缺陷》不要假设硬件按期望工作",
-        "《人月神话》计划再再计划"
+        "《C陷阱与缺陷》「volatile 与编译器优化」",
+        "《人月神话》「计划再计划：对乐观主义的警告」",
+        "《代码大全》ch41「防御性编程」"
       ]
     },
     {
-      "id": "2026-05-05-lowpower-refactor",
-      "title": "从全局状态到层次化电源管理对象",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-refactor",
+      "title": "从轮询到 DMA：UART 接收模块的重构",
+      "topic": "DMA",
       "mode": "refactor",
       "language": "C",
       "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "tool": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["低功耗", "重构", "电源管理", "模块化"],
-      "explanation": "电源管理代码最容易演变成全局变量和散乱的 HAL 调用集合。通过面向对象式的 C 封装，每个电源管理动作（时钟门控、休眠模式切换、电压调节）独立为一个模块，遵循《重构》中提炼模块和以查询取代临时变量的坏味道改进原则。好的软件设计不是预测未来，而是为不可预见的变化做好准备——《重构》第 2 版序言。",
-      "content": "改进前（问题代码）：所有低功耗操作混在一个函数中，使用全局变量 g_power_mode 记录当前状态，GPIO 配置散落在各处且没有统一处理。唤醒后直接调用 SystemClock_Config() 但没有检查时钟源是否真的恢复了。改进后：将电源管理拆分为四个独立模块（clock_gate、sleep_mode、power_domain、wake_config），每个模块有清晰的 init() 和 control() 接口。使用枚举代替魔法数字（PWR_MODE_STOP / PWR_MODE_STANDBY），使用结构体传递参数（power_config_t）。每个操作都有返回值（PowerStatus）表示成功/失败，便于错误处理。代码从 50+ 行混乱的函数重构为 4 个模块共约 80 行的清晰结构，虽然代码量增加了 60%，但可测试性大幅提升——可以单独单元测试 clock_gate_init() 而不需要唤醒整个系统。代价是每个模块调用有约 20ns 的函数调用开销，但在低功耗场景（微安级）这完全可以忽略。",
-      "code": "/* 改进前：全局变量 + 散乱逻辑 */\n/* 问题: 全局状态、无返回值检查、GPIO 配置散落在各处 */\nint g_power_mode = 0;\n\nvoid go_to_sleep_bad(void) {\n    RCC->AHB1ENR &= ~(RCC_AHB1ENR_GPIOEEN | RCC_AHB1ENR_GPIOFEN);\n    RCC->AHB2ENR &= ~RCC_AHB2ENR_OTGFSEN;\n    GPIOA->MODER &= ~(0x3 << 0);\n    GPIOB->MODER &= ~(0x3 << 2);\n    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;\n    g_power_mode = 1;\n    __WFE();\n    HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_5);\n}\n\n/* 改进后：层次化电源管理 */\ntypedef enum { PWR_OK = 0, PWR_FAIL, PWR_UNSUPPORTED } PowerStatus;\ntypedef enum { PWR_MODE_RUN, PWR_MODE_STOP, PWR_MODE_STANDBY } PowerMode;\n\ntypedef struct {\n    uint32_t ahb_mask;\n    uint32_t apb1_mask;\n    uint32_t apb2_mask;\n    uint32_t wake_pin;\n    PowerMode  target_mode;\n} power_config_t;\n\ntypedef struct {\n    PowerStatus (*init)(void);\n    PowerStatus (*control)(power_config_t*);\n} power_module_t;\n\nstatic PowerStatus clock_gate_init(void) {\n    RCC->AHB1ENR &= ~(RCC_AHB1ENR_GPIOEEN | RCC_AHB1ENR_GPIOFEN | RCC_AHB1ENR_GPIOGEN);\n    RCC->AHB2ENR &= ~RCC_AHB2ENR_OTGFSEN;\n    return PWR_OK;\n}\n\nstatic PowerStatus sleep_enter(power_config_t* cfg) {\n    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);\n    __HAL_PWR_WAKEUP_PIN_ENABLE(cfg->wake_pin);\n    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;\n    if (cfg->target_mode == PWR_MODE_STOP) {\n        __WFE();\n    } else if (cfg->target_mode == PWR_MODE_STANDBY) {\n        PWR->CR |= PWR_CR_CSBF;\n        PWR->CR |= PWR_CR_PDDS;\n        __WFI();\n    }\n    return PWR_OK;\n}",
+      "tags": ["DMA", "UART", "重构", "坏味道", "零拷贝"],
+      "explanation": "Martin Fowler 在《重构》中描述的第一个坏味道就是「霰弹枪式修改」——当你改一个需求时，需要在代码的多个地方做相似的修改。轮询 UART 的代码就是典型的坏味道：每增加一个 UART 实例，就要复制粘贴整段 while 循环。重构为 DMA + 环形缓冲区后，新增 UART 实例只需配置不同的 GPIO 和 DMA Stream，核心读取逻辑零修改。——《重构》第 2 版「坏味道：Duplicated Code」",
+      "content": "以下重构演示将一个 UART 轮询接收模块改造为 DMA + 环形缓冲区模块。改进前的代码存在三个明显的《重构》定义的代码坏味道：① Duplicated Code（如果管理多个 UART 实例）② Long Method（read_uart_byte 超过 20 行，职责不清）③ Feature Envy（主循环对 HAL_UART_Receive 的调用频率远高于 UART 模块内部）。\n\n重构后，UART 接收模块封装为一个独立的 uart_ring_buf_t 结构体，每个实例管理自己的 DMA、缓冲区和索引。主循环通过统一的 uart_ring_read() API 读取数据，不再关心底层是轮询还是 DMA。新增第二个 UART 实例时，只需声明另一个 uart_ring_buf_t 实例并调用 uart_ring_init(&uart2_ring, &huart2, dma2_stream2) 即可，核心读取逻辑零修改。\n\n代价：代码量增加了约 40 行（数据结构 + 初始化 + DMA 回调），RAM 占用增加了 UART_RX_BUF_SIZE（256 字节 per 实例）。但如果波特率 ≥ 57600 或有多个 UART 实例需要同时处理，这些代价完全值得。\n\n《UNIX 编程艺术》ch.5「避免外部状态」——DMA 双缓冲本质上是将「外部状态」（DMA 硬件计数器和缓冲区填充量）封装为模块内部的 `volatile` 变量，对外只暴露稳定的 API。",
+      "code": "/* ============ 重构前：轮询 UART 接收（坏味道代码） ============ */\n\n/* 问题 1: 没有封装，所有逻辑散落在 main.c 中 */\n/* 问题 2: 只能处理一个 UART，加第二个就要复制粘贴 */\n/* 问题 3: 阻塞等待——等不到字节就卡死 */\n\n/* main.c — 重构前 */\nvoid main(void) {\n    HAL_Init();\n    SystemClock_Config();\n    MX_USART1_UART_Init();\n\n    while (1) {\n        uint8_t byte;\n        /* 阻塞等待：如果 UART 没数据，主循环就卡在这里 */\n        if (HAL_UART_Receive(&huart1, &byte, 1, 100) == HAL_OK) {\n            /* 收到一字节，但无法处理更多——一次只收一个 */\n            if (byte == 0xAA) {\n                /* 帧头匹配，继续接收剩余数据 */\n                uint8_t frame[32];\n                frame[0] = byte;\n                for (uint8_t i = 1; i < 32; i++) {\n                    /* 又一个阻塞等待！如果发送方中断，整个循环卡死 */\n                    if (HAL_UART_Receive(&huart1, &frame[i], 1, 10) == HAL_OK) {\n                        process_frame(frame, i + 1);\n                    }\n                }\n            }\n        }\n        /* 主循环其他工作被严重挤压 */\n        blink_led();\n    }\n}\n\n/* ============ 重构后：DMA + 环形缓冲区封装 ============ */\n\n/* uart_ring.h — 模块接口 */\ntypedef struct {\n    UART_HandleTypeDef *huart;       /* 关联的 UART 句柄 */\n    uint8_t            *buf;         /* 环形缓冲区指针 */\n    uint16_t            buf_size;    /* 缓冲区大小 */\n    volatile uint16_t   write_idx;   /* DMA 写入索引 */\n    volatile uint16_t   read_idx;    /* 应用层读取索引 */\n    volatile bool       running;     /* DMA 接收是否活跃 */\n} uart_ring_buf_t;\n\n/* 模块 API */\nvoid    uart_ring_init(uart_ring_buf_t *ring, UART_HandleTypeDef *huart,\n                       uint8_t *buf, uint16_t buf_size);\nuint16_t uart_ring_read(uart_ring_buf_t *ring, uint8_t *out, uint16_t maxlen);\nbool     uart_ring_ready(uart_ring_buf_t *ring);  /* 是否有数据可读 */\n\n/* uart_ring.c — 模块实现 */\nvoid uart_ring_init(uart_ring_buf_t *ring, UART_HandleTypeDef *huart,\n                    uint8_t *buf, uint16_t buf_size) {\n    ring->huart = huart;\n    ring->buf = buf;\n    ring->buf_size = buf_size;\n    ring->write_idx = 0;\n    ring->read_idx = 0;\n    ring->running = false;\n\n    /* 启动 DMA 循环接收 */\n    HAL_UART_Receive_DMA(huart, buf, buf_size);\n    ring->running = true;\n}\n\nuint16_t uart_ring_read(uart_ring_buf_t *ring, uint8_t *out, uint16_t maxlen) {\n    uint16_t write = ring->write_idx;\n    uint16_t read  = ring->read_idx;\n    uint16_t avail;\n\n    if (write >= read) {\n        avail = write - read;\n    } else {\n        avail = (ring->buf_size - read) + write;\n    }\n    if (avail == 0) return 0;\n\n    uint16_t copy = (maxlen < avail) ? maxlen : avail;\n    uint16_t first_chunk = (ring->buf_size - read);\n\n    if (copy <= first_chunk) {\n        memcpy(out, &ring->buf[read], copy);\n    } else {\n        memcpy(out, &ring->buf[read], first_chunk);\n        memcpy(&out[first_chunk], ring->buf, copy - first_chunk);\n    }\n    ring->read_idx = (read + copy) % ring->buf_size;\n    return copy;\n}\n\n/* 主循环 — 重构后 */\n/* DMA 回调中更新 write_idx */\nvoid HAL_UART RxCpltCallback(UART_HandleTypeDef *huart) {\n    /* 找到对应的 ring 实例，更新 write_idx */\n    /* 实际项目中用链表或数组管理多个 ring 实例 */\n    uart1_ring.write_idx = (uart1_ring.write_idx + UART_RX_BUF_SIZE) % UART_RX_BUF_SIZE;\n}\n\nvoid main(void) {\n    HAL_Init();\n    SystemClock_Config();\n    MX_USART1_UART_Init();\n    MX_USART2_UART_Init();\n\n    /* 两个 UART 实例，同一套 API — 零重复代码 */\n    uint8_t rx_buf1[UART_RX_BUF_SIZE];\n    uint8_t rx_buf2[UART_RX_BUF_SIZE];\n    uart_ring_init(&uart1_ring, &huart1, rx_buf1, UART_RX_BUF_SIZE);\n    uart_ring_init(&uart2_ring, &huart2, rx_buf2, UART_RX_BUF_SIZE);\n\n    uint8_t frame_buf[256];\n\n    while (1) {\n        /* UART1: 非阻塞读取 */\n        uint16_t len = uart_ring_read(&uart1_ring, frame_buf, sizeof(frame_buf));\n        if (len > 0) {\n            process_frame(frame_buf, len);  /* 处理完整帧 */\n        }\n\n        /* UART2: 同样非阻塞 */\n        len = uart_ring_read(&uart2_ring, frame_buf, sizeof(frame_buf));\n        if (len > 0) {\n            process_gps_frame(frame_buf, len);\n        }\n\n        /* 主循环其他工作正常执行 */\n        blink_led();\n        update_display();\n        check_buttons();\n    }\n}",
       "pitfalls": [
-        "陷阱 1: 重构后忘记在唤醒路径中恢复被门控的时钟 -> 模块化的 init() 只关闭时钟不恢复 -> 唤醒后调用 HAL 外设函数访问已关闭时钟的外设 -> 硬件错误（HardFault）。修复：在 sleep_module 的退出回调中调用每个已使用模块的 restore() 方法。",
-        "陷阱 2: power_config_t 结构体传递方式导致栈溢出 -> 如果 power_config_t 很大（包含多个 uint32_t 数组），按值传递会导致栈帧增大 -> 在 Cortex-M0+ 上（如 STM32L0，栈仅 2KB）可能导致栈溢出。修复：改为传递指针 power_config_t*。",
-        "陷阱 3: 模块化的间接调用导致休眠延迟增加 -> 每个模块的 control() 函数约 20-50 条指令 -> 4 个模块串联约 200 条指令 -> 在 Cortex-M0+ @ 32MHz 下约 6μs 延迟 -> 如果功耗优化目标是纳秒级精确的超低功耗场景（如 BLE 广播窗口对齐），累积延迟需要测试验证。修复：关键路径上的模块调用用宏或内联函数替代。"
+        "陷阱 1：重构时 DMA 回调中更新 write_idx 的锁保护被遗漏 → 主循环读 read_idx 和 write_idx 时，write_idx 正在被 ISR 更新 → 读到不一致的索引值 → 环形缓冲区读取可能跨越无效区域 → 在 uart_ring_read 入口处关中断保存状态，读取完两个索引后再开中断",
+        "陷阱 2：DMA 回调用 HAL_UART_Receive_DMA 重新启动接收 → 如果回调中再次调用 Receive_DMA 且传输长度与缓冲区大小不一致 → DMA NDTR 寄存器被错误设置 → 后续传输长度不对 → DMA 回调中只更新索引，绝不调用任何 HAL 传输函数（Circular 模式下 DMA 自动循环）",
+        "陷阱 3：重构后忘记在 NVIC 中使能 DMA 中断 → 编译通过、链接通过、上电运行，但 DMA 回调永远不会被调用 → write_idx 永远是 0 → 应用层永远读不到数据 → 现象与「接线错误」完全一样 → 重构后第一件事：用示波器测 UART RX 引脚确认数据到达，再用断点验证 DMA 回调是否触发"
       ],
       "refBook": [
-        "《重构》提炼模块",
-        "《UNIX编程艺术》ch.2.1 模块、接口与功能"
+        "《重构》ch.2「坏味道：Duplicated Code」",
+        "《UNIX编程艺术》ch.5「避免外部状态」",
+        "《C语言接口与实现》ch.4「信息隐藏」"
       ]
     }
   ]
