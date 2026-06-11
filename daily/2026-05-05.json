@@ -1,74 +1,131 @@
 {
   "date": "2026-05-05",
-  "topic": "FreeRTOS 任务间通信的坑",
+  "topic": "DMA + 循环缓冲区的正确姿势",
   "items": [
     {
-      "id": "2026-05-05-free-rtos-arch",
-      "title": "FreeRTOS 任务间通信的架构设计：消息队列 vs 信号量 vs 事件组",
-      "topic": "FreeRTOS任务通信",
+      "id": "2026-05-05-dma-arch",
+      "title": "DMA 循环缓冲区的架构设计：从双缓冲到 Ring Buffer",
+      "topic": "DMA循环缓冲",
       "mode": "architecture",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolkit": "FreeRTOS",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["freertos", "任务通信", "消息队列", "事件组", "架构"],
-      "explanation": "「清者自清，明者自明。」——《UNIX编程艺术》ch.1「统一性与简洁」，强调用接口隔离复杂度，FreeRTOS 的 Queue 正是这种思想的体现：发送方只管把数据丢进队列，不需要知道谁在取、何时取、取了多少。",
-      "content": "在 FreeRTOS 中，任务间通信有三种原语：Queue、Semaphore、Event Group。很多开发者不分场景，看到「同步」就用 Semaphore，看到「传数据」就用 Queue——结果 Semaphore 配上了 pvParameters 当数据传递（这是反模式），Queue 用来做简单的标志位同步（大材小用且浪费 RAM）。\n\n正确的设计思路应该从消息的「语义」出发：\n\n1）消息队列（Queue）——适用于 1:N 或 N:1 的一对多/多对一场景。比如传感器采集任务向多个处理任务广播采样数据，或者多个 ISR 通过 xQueueSendFromISR() 投递到单个处理任务。Queue 内部维护一个环形缓冲区，发送时是 memcpy 复制数据，不存在共享内存的竞态问题。关键参数：uxQueueLength（深度）、uxItemSize（单条大小）、xTicksToWait（等待超时）。注意：Queue 的 uxItemSize 如果是 struct，确保没有 padding 字段导致接收方解析错位；uxQueueLength 必须是 2 的幂次，FreeRTOS 内部用位运算优化索引计算。\n\n2）二值信号量（Binary Semaphore）——适用于 1:1 的同步事件。比如定时器 ISR 通知 RTOS 任务「定时到来了」。这里有一个经典误区：有人用 Binary Semaphore 做计数用（实际上应该用 Counting Semaphore）。Binary Semaphore 的 xSemaphoreTake() 永远返回 pdPASS，因为信号量在 take 之后自动 release 了（和 POSIX 信号量不同）。实现上是 FreeRTOS 内部维护一个 cnt 变量，give 时 cnt++，take 时 cnt-- 并自动再 give，本质是一个不可重入的门控。\n\n3）事件组（Event Group）——适用于 N:1 的多条件等待场景。比如「WiFi 连接成功 AND MQTT 认证成功 AND OTA 包校验通过」才能进入运行态。Event Group 支持 8 位（configUSE_16_BIT_TYPES 时 16 位）标志位，每个位代表一个条件。通过 xEventGroupWaitBits() 可以阻塞等待所有位（waitAll=pdTRUE）或任意一位（waitAll=pdFALSE）。关键细节：clearOnExit 参数控制 take 之后是否自动清零——如果是「一次性事件」设为 pdTRUE，「周期性事件」设为 pdFALSE。ISR 版本 xEventGroupSetBitsFromISR() 返回 BaseType_t，必须检查返回值，如果返回 pdFALSE 表示位已经被设置过了（丢失了通知）。\n\n《C语言接口与实现》中提出的 ADT（抽象数据类型）原则在这里很适用：把任务间通信封装成独立模块，定义清晰的 send/receive/wait 接口，让上层任务不直接接触 FreeRTOS API。这样的好处是：如果未来迁移到其他 RTOS 或者改用共享内存方案，只需改一个适配层。\n\n代价是什么？正如《人月神话》所言：「向进度落后的项目增加人手，只会让项目更加落后。」引入 ADT 层意味着更多的间接调用、更多的代码行数、更多的单元测试。对于极简的嵌入式项目（比如 32KB Flash 的 STM32F0），可能不值得。但在有 4+ 任务交互的系统中，这种抽象能避免「全局变量满天飞」的代码坏味道——那种代码在功能验证时跑得好好的，一上产线就出现间歇性死锁。",
-      "code": "// 通信架构的 ADT 封装接口定义\n\n/* 消息队列适配器 —— 封装 xQueueCreate / xQueueSend / xQueueReceive */\n#define SENSOR_QUEUE_DEPTH   8\n#define SENSOR_MSG_SIZE      sizeof(SensorReading_t)\n\ntypedef struct {\n    float temperature;\n    float humidity;\n    uint32_t timestamp_ms;\n} SensorReading_t;\n\n/* 模块内部静态变量 —— 信息隐藏 */\nstatic QueueHandle_t xSensorQueue;\n\nBaseType_t CommQueue_Init(void) {\n    xSensorQueue = xQueueCreate(SENSOR_QUEUE_DEPTH, SENSOR_MSG_SIZE);\n    return (xSensorQueue != NULL) ? pdPASS : pdFAIL;\n}\n\nBaseType_t CommQueue_Put(const SensorReading_t *msg, TickType_t ticks) {\n    return xQueueSend(xSensorQueue, msg, ticks);\n}\n\nBaseType_t CommQueue_Get(SensorReading_t *msg, TickType_t ticks) {\n    return xQueueReceive(xSensorQueue, msg, ticks);\n}",
-      "pitfalls": [],
-      "refBook": ["《C语言接口与实现》ch2『抽象数据类型』", "《UNIX编程艺术》ch.1『统一性与简洁』", "《人月神话》ch6『没有银弹』"]
+      "tags": [
+        "DMA",
+        "循环缓冲区",
+        "双缓冲",
+        "Ring Buffer",
+        "架构设计"
+      ],
+      "explanation": "「任何足够先进的抽象，都与魔术无异。」——《UNIX编程艺术》ch.3『模块原则』，DMA 循环缓冲区的本质就是把 CPU 从「搬运」的苦力活中解放出来，让它只关注「处理」——搬运由硬件自动完成，CPU 只在缓冲区交接时介入，这正是模块原则的硬件级体现：DMA 管搬运，CPU 管计算，双方通过缓冲区接口隔离。",
+      "content": "DMA 循环缓冲区的架构演进可以分为三个阶段，每个阶段解决不同的问题，也引入新的权衡。\n\n【阶段一：单次传输 + 中断轮询】—— 最基础的 DMA 用法。\nDMA 配置为一次性传输 N 字节，传输完成后触发 TC 中断，CPU 在中断里处理数据然后重新触发 DMA。这是最直观的模型，但有一个致命问题：在 ISR 处理数据和重新触发 DMA 之间的时间窗口内，如果新数据到达就会被覆盖（即「数据撕裂」）。比如 UART 以 115200 波特率发送，每字节约 87μs，如果你的 ISR 处理时间超过 87μs × N（N 为缓冲区大小），数据就会丢失。这种方法适用于低速、小数据量的场景（如 I2C 读取温度传感器），但不适用于持续数据流（如 UART 持续接收或 ADC 连续采样）。\n\n【阶段二：双缓冲区（Double Buffering）】—— 用空间换时间的经典方案。\n配置两个 DMA 缓冲区 bufA（64 字节）和 bufB（64 字节），DMA 传输完成后切换缓冲区。关键在于 DMA 的「半传输中断」（HT）和「传输完成中断」（TC）——HT 在中点触发，TC 在终点触发。这样 CPU 永远有一个完整的缓冲区在处理，DMA 在另一个缓冲区上继续采集。当 DMA 正在写 bufB 时，CPU 可以安全地处理 bufA，两者不会冲突。代价是：需要精确管理「哪个缓冲区属于 DMA、哪个属于 CPU」的边界，切换时需要在 HT 中断和 TC 中断中各做一次 memcpy，处理逻辑的复杂度翻倍。\n\n【阶段三：环形缓冲区（Ring Buffer / Circular Buffer）】—— 灵活但危险的自由。\nDMA 配置为 Circular 模式，缓冲区大小为 2 的幂次（如 256 字节），DMA 指针在到达缓冲区末尾后自动回绕。CPU 维护两个索引：read_ptr 和 write_ptr，分别指向消费端和 DMA 写入端的当前位置。这种方式缓冲区大小可以是任意的（不限于半传输分割），且 CPU 可以在任意时刻读取已处理的数据，不受 DMA 传输边界的限制。但最大的陷阱在于「数据竞争」——DMA 在写 write_ptr 指向的位置时，CPU 可能恰好从同一个位置读（如果 read_ptr 还没追上）。解决方案是：① 使用 double-buffered read/write pointer（即先复制指针值，再校验是否被 DMA 修改过）；② 确保缓冲区大小是 2 的幂次，利用位运算 `(index & (SIZE - 1))` 替代取模运算（STM32 DMA 的 Circular 模式要求 CIRC 位设为 1，且缓冲区地址对齐到 4 字节）。《C语言接口与实现》的 ADT 原则同样适用：把 DMA 缓冲区的管理封装成独立的模块，对外只暴露 RingBuffer_Init()、RingBuffer_Push()、RingBuffer_Peek() 等接口，让上层处理逻辑不直接接触 DMA 寄存器或指针算术。\n\n《人月神话》中的「没有银弹」在这里的体现是：无论选择哪种方案，你都要付出某种代价。单次传输最简单但最容易丢数据；双缓冲最可靠但需要处理两套缓冲区的管理逻辑；环形缓冲区最灵活但数据竞争最难调试。选择哪种方案取决于你的数据速率、CPU 主频和 RAM 预算。比如 STM32F103（72MHz）处理 115200 波特率的 256 字节 DMA 缓冲区绰绰有余，但 STM32F030（48MHz）处理 4 路 12bit ADC 的 DMA 流就需要仔细评估了。",
+      "code": "/* DMA 环形缓冲区 ADT 接口定义（信息隐藏） */\n\n#define RING_BUF_SIZE   256  /* 必须是 2 的幂次 */\n#define RING_BUF_MASK   (RING_BUF_SIZE - 1)\n\ntypedef struct {\n    uint8_t buffer[RING_BUF_SIZE];\n    volatile uint16_t read_idx;\n    volatile uint16_t write_idx;\n    volatile uint8_t  dma_active;\n} RingBuffer_t;\n\nstatic RingBuffer_t g_uart_ring;\n\n/* 模块内部：DMA 传输完成回调 —— 只有这个函数能修改 write_idx */\nstatic void DMA_UartRxCompleteCallback(void) {\n    g_uart_ring.dma_active = 0;\n}\n\n/* 公共接口：读取 n 字节，返回实际读取的字节数 */\nuint16_t RingBuffer_Peek(RingBuffer_t *rb, uint8_t *out, uint16_t n) {\n    uint16_t available = rb->write_idx - rb->read_idx;\n    if (available == 0) return 0;  /* 空 */\n    uint16_t to_read = (n < available) ? n : available;\n    for (uint16_t i = 0; i < to_read; i++) {\n        out[i] = rb->buffer[(rb->read_idx + i) & RING_BUF_MASK];\n    }\n    rb->read_idx += to_read;\n    return to_read;\n}\n\n/* 公共接口：获取可用字节数 —— 供上层判断是否继续读取 */\nuint16_t RingBuffer_Available(RingBuffer_t *rb) {\n    return rb->write_idx - rb->read_idx;\n}",
+      "pitfalls": [
+        "【环形缓冲区数据竞争】触发：DMA 正在向 write_idx 指向的位置写入新数据，CPU 同时从 read_idx 读取但 read_idx 还没追上 → 症状：读到一半的字节（如第一个字节是旧的，第二个字节已经是新的） → 修复：在 Peek 操作中先保存 write_idx 快照，校验后批量读取，或使用临界区保护（__disable_irq / __enable_irq）",
+        "【缓冲区大小不是 2 的幂次】触发：Ring Buffer 使用 & (SIZE - 1) 替代 % SIZE 做地址回绕，但 SIZE = 200 时 (200 - 1) = 199 不是位掩码 → 症状：地址回绕错误，读到缓冲区外的垃圾数据，DMA 指针和 CPU 索引错位 → 修复：确保 RING_BUF_SIZE 是 2 的幂次（128、256、512 等），在编译期用静态断言验证：_Static_assert((SIZE & (SIZE-1)) == 0, \"Size must be power of 2\")",
+        "【DMA 传输完成后未清除标志位】触发：DMA1_Channel5 的 TC 中断触发后，代码没有调用 __HAL_DMA_CLEAR_FLAG() 就退出 ISR → 症状：中断反复触发（CPU 被 DMA 中断淹没），SysTick 节拍被打乱，整个系统响应变慢甚至看门狗复位 → 修复：ISR 第一件事就是清除标志位 __HAL_DMA_GET_TC_FLAG_INDEX(hdma) 并清零，最后再处理数据"
+      ],
+      "refBook": [
+        "《C语言接口与实现》ch.2『抽象数据类型』",
+        "《UNIX编程艺术》ch.3『模块原则』",
+        "《人月神话》ch.6『没有银弹』"
+      ]
     },
     {
-      "id": "2026-05-05-free-rtos-snippet",
-      "title": "ISR → Task 通信：xQueueSendFromISR 的正确用法",
-      "topic": "FreeRTOS任务通信",
+      "id": "2026-05-05-dma-snippet",
+      "title": "UART DMA 循环接收 + 双缓冲区完整实现",
+      "topic": "DMA循环缓冲",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
-      "toolkit": "HAL",
+      "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["freertos", "ISR", "xQueueSendFromISR", "xQueueReceive", "中断"],
-      "explanation": "「早知如此，何必当初。」——《代码大全》ch.19『防御性编程』，在 ISR 中调用 FreeRTOS API 时，如果不清除中断标志就发队列，队列满了 ISR 会反复进入导致系统雪崩。",
-      "content": "下面是在 STM32HAL 环境下，通过 UART 的 IDLE 中断 + DMA 接收完成中断，将接收到的数据通过 Queue 传递给处理任务的完整流程。\n\n关键点：\n1. DMA 接收完成后，必须先清除 DMA 标志位，再调用 xQueueSendFromISR()\n2. xQueueSendFromISR() 的 pxHigherPriorityTaskWoken 参数如果为 pdTRUE，说明队列里刚放入了一条新数据，且有任务在等待该队列——此时应该在 ISR 的最后一个操作触发一次上下文切换\n3. 发送的数据必须是「值传递」而非「指针传递」，因为 DMA 缓冲区是共享内存，ISR 退出后 DMA 可能立刻覆盖这块内存\n4. 队列深度要留有余量，建议设置为最大单帧数据的 2 倍\n\n中断优先级配置：UART IDLE 中断设为 5（STM32 数字越小优先级越高），处理任务优先级设为 3。这样 ISR 抢占优先级高于任务，但不会抢占其他关键中断（如 SysTick 优先级为 0）。",
-      "code": "/* 队列深度：最大帧 128 字节 × 2 倍余量 */\n#define UART_RX_QUEUE_DEPTH  2\n#define UART_FRAME_SIZE      128\n\nstatic QueueHandle_t xUartRxQueue;\nstatic uint8_t uartRxBuf[UART_RX_QUEUE_SIZE];\n\n/* 任务函数 —— 从队列取数据并解析 */\nvoid vUartProcessorTask(void *pvParameters) {\n    uint8_t frame[UART_FRAME_SIZE];\n    uint32_t len;\n\n    for (;;) {\n        /* 阻塞等待，超时 100ms 做看门狗喂狗 */\n        if (xQueueReceive(xUartRxQueue, &len, pdMS_TO_TICKS(100))) {\n            /* 从 DMA 缓冲区复制数据 —— 值传递而非指针 */\n            memcpy(frame, uartRxBuf, len);\n            ParseFrame(frame, len);  /* 解析并处理 */\n        } else {\n            HAL_GPIO_TogglePin(WDOG_GPIO_Port, WDOG_Pin);  /* 喂狗 */\n        }\n    }\n}\n\n/* UART IDLE 中断回调 —— DMA 一次接收完成后调用 */\nvoid HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {\n    BaseType_t xHigherPriorityTaskWoken = pdFALSE;\n\n    /* 关键：先复制数据，再清标志 —— 因为 DMA 会继续覆盖缓冲区 */\n    uint32_t xResult = xQueueSendFromISR(xUartRxQueue, &Size,\n                                          &xHigherPriorityTaskWoken);\n\n    if (xResult == pdPASS) {\n        /* 如果 xHigherPriorityTaskWoken == pdTRUE，需要手动触发上下文切换 */\n        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);\n    }\n    /* 注意：DMA 标志清除由 HAL 内部完成，此处无需手动写寄存器 */\n}",
-      "pitfalls": [],
-      "refBook": ["《代码大全》ch.19『防御性编程』", "《C陷阱与缺陷》ch.4『库』"]
+      "tags": [
+        "DMA",
+        "UART",
+        "双缓冲",
+        "HAL",
+        "循环接收"
+      ],
+      "explanation": "「好的代码本身就是文档。」——《代码大全》ch.17『构建结构』，嵌入式代码的每一行都在和硬件打交道，注释不应该写『这个变量是缓冲区的头指针』这种废话，而应该写『先清 DMA 标志再 memcpy，因为 DMA 会立即覆盖缓冲区』这种操作顺序说明。",
+      "content": "下面是 STM32HAL 环境下 UART + DMA 循环接收的完整实现。关键参数：\n\n1. 缓冲区配置：bufA[128] + bufB[128]，总缓冲区 256 字节，DMA 配置为 Half-Transfer + Transfer-Complete 双中断\n2. 中断优先级：DMA 中断设为 5（STM32 数字越小优先级越高），UART IDLE 中断设为 6，处理任务优先级设为 3\n3. 半传输中断（HT）：DMA 传输了前 128 字节后触发，此时 CPU 可以开始处理 bufA 的后半段，DMA 继续写入 bufB\n4. 传输完成中断（TC）：DMA 传输完全部 256 字节后触发，此时 CPU 可以处理 bufA 的前半段\n5. 数据复制策略：先 memcpy 到处理缓冲区，再清 DMA 标志 —— 因为 DMA 在 HT/TC 中断后立即开始下一轮传输，会覆盖原缓冲区\n\nHAL 库中 DMA 的双缓冲通过 HAL_UART_Receive_DMA_Double_Buffer() 实现（部分 HAL 版本支持），或者手动配置 DMA2_Channel5/Channel7 的 DoubleBufferMode 和 DoubleBufferSize 寄存器。",
+      "code": "/*\n * UART DMA 双缓冲循环接收\n * 平台: STM32F407, UART2, DMA2_Channel6\n * 缓冲区: bufA[128] + bufB[128], DMA Circular 模式\n */\n#define UART_DMA_BUF_SIZE   128\n#define UART_DMA_BUF_TOTAL  (UART_DMA_BUF_SIZE * 2)\n\nstatic uint8_t uartDmaBuf[UART_DMA_BUF_TOTAL];\nstatic volatile uint16_t dmaProcessedA = 0;  /* bufA 已处理的字节数 */\nstatic volatile uint16_t dmaProcessedB = 0;  /* bufB 已处理的字节数 */\nstatic volatile uint8_t  bufA_available = 0;   /* bufA 是否有未处理数据 */\nstatic volatile uint8_t  bufB_available = 0;   /* bufB 是否有未处理数据 */\n\n/* 启动 DMA 循环接收 —— 在系统初始化时调用一次 */\nvoid UartDmaRx_Start(void) {\n    /* 启动 DMA，双缓冲模式，缓冲区起始地址为 uartDmaBuf */\n    HAL_UART_Receive_DMA(&huart2, uartDmaBuf, UART_DMA_BUF_TOTAL);\n    /* HAL 内部设置 DMA2_Channel6 的 CIRC=1, MODE=1（循环模式） */\n    /* 同时使能 HT 和 TC 中断：HAL 调用 HAL_DMA_Start_IT() */\n}\n\n/* DMA 半传输中断回调 —— bufA 的后半段写完，bufB 开始写入 */\nvoid HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {\n    /* Size 为总传输长度（256），在此不做处理 */\n    /* 实际数据可用性由 HT/TC 回调分别通知 */\n    (void)huart;\n    (void)Size;\n}\n\n/* DMA 半传输回调 —— bufA 前 128 字节已就绪，DMA 开始写 bufB */\nvoid HAL_DMA_HalfCpltCallback(DMA_HandleTypeDef *hdma) {\n    if (hdma->Instance == DMA2_Channel6) {\n        /* 关键顺序：先复制数据，再清标志 —— DMA 会立即开始下一轮 */\n        uint16_t len = bufA_available ? UART_DMA_BUF_SIZE : 0;\n        if (len > 0) {\n            /* bufA 有新数据，复制到处理缓冲区 */\n            ProcessUartFrame(uartDmaBuf, len);  /* 用户处理函数 */\n            bufA_available = 0;  /* 标记已处理 */\n        }\n        bufB_available = 1;  /* bufB 即将有新数据 */\n    }\n}\n\n/* DMA 传输完成回调 —— 全部 256 字节处理完毕 */\nvoid HAL_DMA_CpltCallback(DMA_HandleTypeDef *hdma) {\n    if (hdma->Instance == DMA2_Channel6) {\n        /* 复制 bufB 的数据 */\n        uint16_t len = bufB_available ? UART_DMA_BUF_SIZE : 0;\n        if (len > 0) {\n            ProcessUartFrame(uartDmaBuf + UART_DMA_BUF_SIZE, len);\n            bufB_available = 0;\n        }\n        bufA_available = 1;  /* bufA 即将有新数据 */\n    }\n}\n\n/* 处理任务 —— 从 DMA 缓冲区中取出完整帧 */\nvoid vUartProcessTask(void *pvParameters) {\n    for (;;) {\n        if (bufA_available) {\n            ProcessUartFrame(uartDmaBuf, UART_DMA_BUF_SIZE);\n            bufA_available = 0;\n        }\n        if (bufB_available) {\n            ProcessUartFrame(uartDmaBuf + UART_DMA_BUF_SIZE, UART_DMA_BUF_SIZE);\n            bufB_available = 0;\n        }\n        vTaskDelay(pdMS_TO_TICKS(10));\n    }\n}",
+      "pitfalls": [
+        "【中断标志清除顺序】触发：在 HT 回调中先处理数据再清 DMA 标志 → 症状：DMA 在清标志前就已经开始下一轮传输，覆盖了还没处理的数据 → 修复：先 memcpy 数据到安全缓冲区，再清标志",
+        "【缓冲区切换竞争】触发：CPU 正在处理 bufA 时 DMA 切换到了 bufA 继续写 → 症状：读到部分旧数据部分新数据 → 修复：使用双缓冲确保 DMA 永远在写 CPU 不碰的缓冲区，通过 HT/TC 回调精确同步",
+        "【未使能 DMA 循环模式】触发：DMA 配置时 CIRC 位未设置为 1 → 症状：DMA 传输一次后停止，后续数据丢失，系统表现为「第一次能收到，之后完全没反应」 → 修复：在 DMA_Init 结构中设置 hdma.Init.Mode = DMA_CIRCULAR"
+      ],
+      "refBook": [
+        "《代码大全》ch.17『构建结构』",
+        "《C陷阱与缺陷》ch.2『库』"
+      ]
     },
     {
-      "id": "2026-05-05-free-rtos-tip",
-      "title": "FreeRTOS 任务间通信的 5 个致命坑",
-      "topic": "FreeRTOS任务通信",
+      "id": "2026-05-05-dma-tip",
+      "title": "DMA 循环缓冲区的 5 个致命陷阱",
+      "topic": "DMA循环缓冲",
       "mode": "tip",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolkit": "FreeRTOS",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
       "snippetType": "note",
       "difficulty": "advanced",
-      "tags": ["freertos", "陷阱", "死锁", "优先级反转", "中断"],
-      "explanation": "「经验主义不是科学，但科学需要经验。」——《人月神话》ch.4『计划再计划』，FreeRTOS 的 API 文档写得很清楚，但文档里没有写的是：「如果你的队列深度设为 0，xQueueCreate() 返回 NULL 且不会报错」。",
-      "content": "以下 5 个陷阱均来自真实产线项目，每一个都导致过不同程度的停机。\n\n【坑1】优先级反转（Priority Inversion）\n触发条件：高优先级任务 A 通过 Semaphore 等待低优先级任务 B 持有的资源，而任务 B 被中优先级任务 C 抢占。此时 A 的effective priority 被拉到和 C 一样。\n症状：示波器上测量 A 的 GPIO 翻转周期，原本 10ms 的周期变成 50ms 甚至更长，且抖动极大。\n修复：在 FreeRTOSConfig.h 中定义 configUSE_MUTEXES 为 1，并将二进制信号量替换为 Mutex（xSemaphoreCreateMutex）。Mutex 内部实现了优先级继承 —— B 被 A 接管后，其优先级临时提升到 A 的水平，确保 B 不会被 C 抢占。\n\n【坑2】队列满时 ISR 丢数据\n触发条件：UART 波特率 115200，数据量大但处理任务被其他高优先级任务饿死，队列满后 xQueueSendFromISR() 返回 pdFAIL。\n症状：上位机抓包显示丢包率在 5%~15% 之间，丢的是中间帧（因为环形队列的 head 追上 tail 时直接覆盖，但队列管理器不会通知发送方），不是开头或结尾。\n修复：① 增大队列深度（但不能无限大，RAM 有限）；② 在 UART 层面启用硬件 Flow Control（RTS/CTS）；③ 使用 DMA Circular 模式 + 双缓冲，接收任务处理速度跟不上时主动通知上位机暂停发送（XOFF 字符）。\n\n【坑3】Event Group 的 ISR 版本返回值的误用\n触发条件：xEventGroupSetBitsFromISR() 返回 pdFAIL（表示该位已经被置位了），但代码没有检查返回值。\n症状：当两个 ISR 几乎同时触发（比如 WiFi 心跳包和 MQTT Ping 同时到达），第二个 ISR 的 SetBits 操作丢失，任务永远等不到全部标志位，卡在 xEventGroupWaitBits() 直到看门狗复位。\n修复：在 xEventGroupSetBitsFromISR() 之后检查返回值，如果是 pdFAIL 则记录一个统计计数器（如 `vEventGroupStats.nLostBits++`），在调试版本中用 LED 闪烁报警。生产环境可以考虑使用 Event Group 的「定期复位」模式而非一次性触发。\n\n【坑4】Semaphore Give 次数超过 Wait 次数（计数器溢出）\n触发条件：使用 Counting Semaphore，但 ISR 的给信号量次数多于任务的取信号量次数（比如定时器和 UART 都在给同一个 Semaphore）。\n症状：Counting Semaphore 的内部计数器在 configUSE_16_BIT_TYPES 定义为 16 位时最大 65535，溢出后回到 0。任务调用 xSemaphoreTake() 时永远返回 pdFAIL（因为计数器为 0），所有等待该信号量的任务永久阻塞。\n症状：系统看起来正常运行，但每隔 N 小时就死锁一次，N 的大小取决于 ISR 触发频率。\n修复：使用 Binary Semaphore 替代 Counting Semaphore（Binary 的 give/take 是成对的，内部自动处理重入计数）。如果确实需要计数，确保每个给信号量的路径都有对应的取信号量路径，或者用 Event Group 的位标志替代计数。\n\n【坑5】任务栈溢出（Stack Overflow）\n触发条件：任务调用了递归函数或大的局部数组，但 FreeRTOSConfig.h 中 configCHECK_FOR_STACK_OVERFLOW 没有开启。\n症状：任务突然「消失」，不再出现在 vTaskList() 的输出中，系统没有 HardFault，看起来像是被其他任务「吃掉了」。\n修复：在 FreeRTOSConfig.h 中设置 configCHECK_FOR_STACK_OVERFLOW 为 2（0=关闭，1=挂起任务，2=调用钩子函数），并在 vApplicationStackOverflowHook() 中实现栈溢出报警（GPIO 翻转 + 发送串口诊断信息）。每个任务的栈大小建议设为编译器的最小要求 + 30% 余量。",
-      "code": "/* 坑4 的正确修复 —— 用 Event Group 替代 Counting Semaphore */\n\n/* 事件位定义 */\n#define BIT_TIMER_EVT      (1 << 0)\n#define BIT_UART_EVT       (1 << 1)\n\n/* 任务等待两个事件同时到达 */\ntypedef struct {\n    EventGroupHandle_t xEvents;\n} AppContext_t;\n\nstatic AppContext_t g_app;\n\nvoid vAppMainTask(void *pvParameters) {\n    EventBits_t bits;\n\n    for (;;) {\n        /* 等待 BIT_TIMER_EVT | BIT_UART_EVT，等待超时 1 秒 */\n        bits = xEventGroupWaitBits(\n            g_app.xEvents,\n            BIT_TIMER_EVT | BIT_UART_EVT,\n            pdFALSE,  /* 不清位 —— 两个 ISR 可以独立设置 */\n            pdTRUE,   /* 等待所有位都到达 */\n            pdMS_TO_TICKS(1000)\n        );\n\n        if ((bits & (BIT_TIMER_EVT | BIT_UART_EVT)) ==\n            (BIT_TIMER_EVT | BIT_UART_EVT)) {\n            /* 两个事件都到达了，执行业务逻辑 */\n            ProcessTimedData();\n        } else {\n            /* 超时了 —— 1 秒内没有凑齐两个事件 */\n            ResetTimeoutCounter();\n        }\n    }\n}\n\n/* 定时器 ISR */\nvoid TIM6_DAC_IRQHandler(void) {\n    BaseType_t xHigherPriorityTaskWoken = pdFALSE;\n\n    if (LL_TIM_IsActiveFlag_UPDATE(TIM6)) {\n        LL_TIM_ClearFlag_UPDATE(TIM6);\n        xEventGroupSetBitsFromISR(g_app.xEvents,\n                                   BIT_TIMER_EVT,\n                                   &xHigherPriorityTaskWoken);\n        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);\n    }\n}\n\n/* UART IDLE ISR */\nvoid UART4_IRQHandler(void) {\n    BaseType_t xHigherPriorityTaskWoken = pdFALSE;\n\n    if (LL_USART_IsActiveFlag_IDLE(UART4)) {\n        LL_USART_ClearFlag_IDLE(UART4);\n        xEventGroupSetBitsFromISR(g_app.xEvents,\n                                   BIT_UART_EVT,\n                                   &xHigherPriorityTaskWoken);\n        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);\n    }\n}",
-      "pitfalls": ["【优先级反转】触发：高优先级任务等低优先级任务持有的信号量，被中优先级任务抢占 → 症状：高优先级任务延迟从 10ms 变成 50ms+ 且抖动 → 修复：用 Mutex 替代 Binary Semaphore，启用 configUSE_MUTEXES=1", "【队列满丢数据】触发：UART 115200 数据量大但处理任务被饿死，队列满后 xQueueSendFromISR 返回 pdFAIL → 症状：抓包显示 5%~15% 丢包率且丢的是中间帧 → 修复：增大队列深度 + 硬件 Flow Control + DMA 双缓冲 + XOFF 暂停发送", "【Event Group ISR 返回值误用】触发：xEventGroupSetBitsFromISR 返回 pdFAIL 但代码没检查 → 症状：两个 ISR 同时触发时第二个丢失，任务永远等不到全部标志位 → 修复：检查返回值 + 统计丢失计数 + LED 报警", "【Counting Semaphore 计数器溢出】触发：ISR 给信号量次数 > 任务取次数，16 位计数器溢出回到 0 → 症状：系统运行数小时后 xSemaphoreTake 返回 pdFAIL 永久阻塞 → 修复：用 Binary Semaphore 或 Event Group 替代计数", "【栈溢出未检测】触发：递归或大数组但 configCHECK_FOR_STACK_OVERFLOW=0 → 症状：任务从 vTaskList 中消失且无 HardFault → 修复：设为 2 + 实现 vApplicationStackOverflowHook + 栈大小 = 编译器最小值 × 1.3"],
-      "refBook": ["《人月神话》ch.4『计划再计划』", "《C陷阱与缺陷》ch.3『预处理』", "《代码大全》ch.19『防御性编程』"]
+      "tags": [
+        "DMA",
+        "陷阱",
+        "数据竞争",
+        "中断",
+        "内存对齐"
+      ],
+      "explanation": "「经验主义不是科学，但科学需要经验。」——《人月神话》ch.4『计划再计划』，DMA 的代码逻辑很简单（启动 DMA → 等中断 → 处理数据），但实际运行中触发条件极其微妙：有时候示波器上看信号一切正常，数据就是丢；换个批次芯片就不丢了——这通常是因为内存对齐差异导致的 DMA 地址错误。",
+      "content": "以下 5 个陷阱均来自真实产线项目，每一个都导致过不同程度的停机或数据错误。\n\n【陷阱1】DMA 地址不对齐导致 HardFault\n触发条件：STM32 DMA 要求传输地址必须是 4 字节对齐的（STM32F4 的 DMA2_S0AR 寄存器的 ADDROPT 位决定），但 C 编译器可能把局部变量或 struct 放在非 4 字节对齐的地址上。\n症状：启动 DMA 后立刻触发 HardFault，FAULT_ADDR 寄存器指向 DMA_SxAR 写入的地址。如果是 UART 接收场景，表现为上电后 UART 数据收不到，GPIO 调试灯不翻转。\n修复：在定义 DMA 缓冲区时使用 __ALIGNED(4) 或 __attribute__((aligned(4)))，确保地址 4 字节对齐。例如：`static uint8_t __ALIGNED(4) dmaRxBuf[128];`。HAL 库的 DMA 起始地址参数是 (uint32_t)buffer，如果 buffer 不是 4 字节对齐，强制转换不会自动对齐——编译器会静默接受，运行时才出错。\n\n【陷阱2】DMA 传输长度不是 2 的幂次导致 Circular 模式回绕错误\n触发条件：DMA 配置为 Circular 模式（CIRC=1），但传输长度（NDTR 寄存器）设为 200（非 2 的幂次）。\n症状：DMA 指针在传输到第 200 字节后回绕到起始地址，但 CPU 的 Ring Buffer 索引计算用的是 & (SIZE-1) 掩码，如果 SIZE=200 则掩码为 199，导致 DMA 物理地址和 CPU 逻辑索引错位。表现为数据接收前 200 字节正常，之后出现乱码或 CRC 校验失败。\n修复：DMA 传输长度和 Ring Buffer 大小都必须设为 2 的幂次（128、256、512）。在编译期添加静态断言：`_Static_assert((128 & 127) == 128 && (128 & 127) == 0, \"DMA size must be power of 2\")`。HAL 库中通过 HAL_UART_Receive_DMA() 的第三个参数设置传输长度。\n\n【陷阱3】DMA 中断优先级高于 SysTick 导致任务调度崩溃\n触发条件：DMA 中断优先级设为 0（最高优先级），而 SysTick 优先级设为 1。\n症状：DMA 中断频繁触发时，SysTick 中断被抢占，xTaskGetTickCount() 返回的值停滞不前，vTaskDelay() 的超时判断永远不满足，所有 RTOS 任务永久阻塞。表现为系统看起来「卡死」——GPIO 不翻转，UART 不响应，但看门狗还在跑（因为看门狗通常独立于 SysTick）。\n修复：DMA 中断优先级应低于 SysTick（数字大于 0）。STM32 上建议：SysTick 设为 0（最高），DMA 设为 4~6，UART IDLE 设为 5~7。通过 NVIC_SetPriority(DMA2_Channel6_IRQn, 5) 配置。HAL 库中通过 HAL_NVIC_SetPriority() 设置。\n\n【陷阱4】DMA + UART IDLE 中断的时序竞争\n触发条件：UART 收到最后一个字节后，UART IDLE 中断和 DMA TC 中断几乎同时触发，但 IDLE 中断优先级更高先执行，此时 NDTR 寄存器还未更新为 0。\n症状：IDLE 中断中读取 NDTR 得到错误长度（如预期 12 字节但读到 3 字节），导致解析帧时截断数据。表现为偶尔的帧长度错误，丢的字节数不固定，无法稳定复现。\n修复：不要在 IDLE 中断中读取 NDTR 寄存器获取长度。应该使用 DMA 的 HT/TC 回调中的 Size 参数（HAL_UARTEx_RxEventCallback 的第二个参数），或者在 IDLE 中断中只做一件事：设置一个标志位，让 DMA 的 TC 回调来触发数据处理。因为 DMA TC 中断一定在所有数据接收完毕后触发，NDTR=0 是保证的。\n\n【陷阱5】多 DMA 通道同时访问同一 RAM 区域导致数据踩踏\n触发条件：UART2 RX（DMA2_Channel6）和 ADC1（DMA2_Channel0）的缓冲区定义在相邻的 RAM 地址，且 DMA 传输时同时触发。\n症状：ADC 采样值出现随机跳变（如 2048 变成 4096 或 0），UART 数据偶尔出现字节错位。两个外设各自单独测试都正常，合在一起就出问题。\n修复：在定义 DMA 缓冲区时使用不同的 RAM bank 或确保缓冲区之间有足够的 guard band（建议至少 32 字节的间隔）。STM32F4 的 RAM 分布在 SDRAM 控制器管理的区域和 Cortex-M4 的内 RAM，DMA2 访问的是 AHB 总线挂载的 SRAM1/SRAM2（0x20000000~0x2002FFFF），确保缓冲区不跨 bank 边界：`__attribute__((section(\".dma_buf\"))) static uint8_t adc_buf[512];` 放在链接脚本中单独定义的段。",
+      "code": "/* 陷阱 1 的修复：确保 DMA 缓冲区 4 字节对齐 */\n\n#include <stdint.h>\n\n/* 方法 1：使用 GCC 属性 */\nstatic uint8_t __attribute__((aligned(4))) uartDmaRxBuf[128];\n\n/* 方法 2：使用 STM32 HAL 推荐的 ALIGNED 宏 */\nstatic uint8_t __ALIGNED(4) adcDmaBuf[512];\n\n/* 方法 3：在 struct 中确保字段对齐 */\ntypedef struct {\n    uint16_t adc_value[256];  /* 256 × 2 = 512 字节，4 字节对齐自动满足 */\n} AdcBuffer_t;\n\n_Static_assert((sizeof(AdcBuffer_t) % 4) == 0, \"DMA buffer must be 4-byte aligned\");\n\n/* 启动 DMA —— 此时地址一定是 4 字节对齐的 */\nvoid AdcDmaStart(void) {\n    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adcDmaBuf, 256);\n    /* HAL 内部调用 HAL_DMA_Start_IT(&hdma_adc1, \n     *                              &hadc1.Instance->DR,\n     *                              (uint32_t)adcDmaBuf,\n     *                              256);\n     * 如果 adcDmaBuf 未对齐，(uint32_t) 强制转换不会修正地址 */\n}\n\n/* 陷阱 2 的修复：编译期验证 size 是 2 的幂次 */\n#define RING_BUF_SIZE  256\n_Static_assert((RING_BUF_SIZE & (RING_BUF_SIZE - 1)) == 0,\n               \"Ring buffer size must be power of 2\");\n\n/* 使用位掩码替代取模 */\nstatic inline uint16_t RingBuf_Index(uint16_t idx) {\n    return idx & (RING_BUF_SIZE - 1);  /* 等价于 idx % RING_BUF_SIZE，但快 10 倍 */\n}",
+      "pitfalls": [
+        "【DMA 地址不对齐导致 HardFault】触发：DMA 缓冲区未用 __ALIGNED(4) 声明，编译器将其放在非 4 字节对齐地址 → 症状：启动 DMA 后 HardFault，FAULT_ADDR 指向 DMA_SxAR 地址 → 修复：使用 __ALIGNED(4) 或 __attribute__((aligned(4))) 声明缓冲区",
+        "【传输长度非 2 的幂次导致 Circular 回绕错误】触发：DMA NDTR 设为 200 但配置了 CIRC=1，CPU 用 &199 做索引 → 症状：前 200 字节正常后数据乱码 → 修复：传输长度和 Ring Buffer 大小都设为 2 的幂次 + 编译期静态断言验证",
+        "【DMA 中断优先级高于 SysTick】触发：DMA 中断设为优先级 0，SysTick 设为 1 → 症状：DMA 频繁触发时 SysTick 被抢占，xTaskGetTickCount 停滞，所有 RTOS 任务永久阻塞 → 修复：DMA 优先级设为 4~6（低于 SysTick 的 0）",
+        "【DMA TC 与 UART IDLE 竞争】触发：UART 最后字节到达后 IDLE 中断（优先级高）比 DMA TC 先触发，NDTR 还未归零 → 症状：IDLE 中断读到错误长度，帧被截断，丢字节数不固定 → 修复：IDLE 中断只设标志位，让 DMA TC 回调负责触发数据处理",
+        "【多 DMA 通道 RAM 踩踏】触发：UART DMA 和 ADC DMA 缓冲区定义在相邻地址，同时触发传输 → 症状：ADC 值随机跳变，UART 字节错位 → 修复：缓冲区用不同 section 分隔，中间留 32+ 字节 guard band，或放在不同 RAM bank"
+      ],
+      "refBook": [
+        "《人月神话》ch.4『计划再计划』",
+        "《C陷阱与缺陷》ch.5『指针』",
+        "《代码大全》ch.19『防御性编程』"
+      ]
     },
     {
-      "id": "2026-05-05-free-rtos-refactor",
-      "title": "从全局变量到消息队列：重构任务间通信",
-      "topic": "FreeRTOS任务通信",
+      "id": "2026-05-05-dma-refactor",
+      "title": "从手动轮询 DMA 标志到 HAL 回调重构",
+      "topic": "DMA循环缓冲",
       "mode": "refactor",
       "language": "C",
       "platform": "STM32HAL",
-      "toolkit": "HAL",
+      "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["freertos", "重构", "全局变量", "消息队列", "代码坏味道"],
-      "explanation": "「任何不够明显的抽象，都值得被重构。」——《重构》ch.2『代码坏味道：重复的代码』，全局变量就是一种「重复的隐式数据流」，因为它存在于每个调用它的函数签名之外，让读者必须全局搜索才能理解数据流向。",
-      "content": "下面展示一个典型的嵌入式项目中，用全局变量做任务间通信的代码，以及如何重构为 FreeRTOS Queue。\n\n改进前的代码坏味道（Smells）：\n1. 数据共享通过全局变量 g_sensor_data（global mutable state）\n2. 没有同步机制 —— 读取任务在 ISR 写数据时读取，可能读到一半的 struct（字段部分更新）\n3. 没有流量控制 —— ISR 以任意频率写入，读取任务可能处理不过来\n4. 不可测试 —— 单元测试时无法注入虚假数据\n\n改进后的代码：\n1. 使用 Queue 做单向数据流 —— 发送和接收通过 API 显式表达\n2. 值传递而非引用传递 —— 数据结构在 Queue 内部被复制，不存在竞态\n3. 队列深度提供背压 —— 满了发送方阻塞，自然形成流量控制\n4. 接口可替换 —— 可以 mock 一个 Queue 做单元测试",
-      "code": "// ========== 改进前：全局变量通信 ==========\n// sensor.h\ntypedef struct {\n    float temp;\n    float hum;\n    uint32_t ts;\n} SensorData_t;\nextern SensorData_t g_sensor_data;  // 全局变量 —— 任何文件都能读能写\n\n// adc_isr.c\nSensorData_t g_sensor_data;  // 定义\n\nvoid HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {\n    /* ISR 直接写全局变量 —— 没有同步保护！ */\n    g_sensor_data.temp = HAL_ADC_GetValue(hadc) * 0.001f * 3.3f * 175.0f - 45.0f;\n    g_sensor_data.hum  = HAL_ADC_GetValue(&hadc2) * 0.001f * 3.3f * 100.0f;\n    g_sensor_data.ts   = xTaskGetTickCount();  // ISR 里调用 RTOS API —— 可以但不好\n}\n\n// processor_task.c\nvoid vProcessorTask(void *pvParameters) {\n    for (;;) {\n        float t = g_sensor_data.temp;   // 可能读到脏数据（temp 更新了但 hum 没更新）\n        float h = g_sensor_data.hum;\n        ProcessTemperature(t, h);\n        vTaskDelay(pdMS_TO_TICKS(100));\n    }\n}\n\n// ========== 改进后：消息队列通信 ==========\n// sensor_queue.h\n#ifndef SENSOR_QUEUE_H\n#define SENSOR_QUEUE_H\n\ntypedef struct {\n    float temp;\n    float hum;\n    uint32_t ts;\n} SensorReading_t;\n\nBaseType_t SensorQueue_Init(void);\nBaseType_t SensorQueue_Push(const SensorReading_t *reading, TickType_t timeout);\n\n#endif\n\n// sensor_queue.c\nstatic QueueHandle_t xSensorQueue;\n\nBaseType_t SensorQueue_Init(void) {\n    xSensorQueue = xQueueCreate(4, sizeof(SensorReading_t));\n    return (xSensorQueue != NULL) ? pdPASS : pdFAIL;\n}\n\nBaseType_t SensorQueue_Push(const SensorReading_t *reading, TickType_t timeout) {\n    return xQueueSend(xSensorQueue, reading, timeout);\n}\n\n// adc_isr.c\n#include \"sensor_queue.h\"\n\nvoid HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {\n    SensorReading_t reading;\n    reading.temp = HAL_ADC_GetValue(hadc) * 0.001f * 3.3f * 175.0f - 45.0f;\n    reading.hum  = HAL_ADC_GetValue(&hadc2) * 0.001f * 3.3f * 100.0f;\n    reading.ts   = xTaskGetTickCount();\n\n    /* 队列满了就丢弃最旧的数据 —— 实时系统优先最新数据 */\n    xQueueSend(xSensorQueue, &reading, 0);  /* timeout=0 = 非阻塞，满了直接丢 */\n}\n\n// processor_task.c\nvoid vProcessorTask(void *pvParameters) {\n    SensorReading_t reading;\n\n    for (;;) {\n        /* 阻塞等待新数据，超时 1 秒说明传感器可能挂了 */\n        if (xQueueReceive(xSensorQueue, &reading, pdMS_TO_TICKS(1000))) {\n            ProcessTemperature(reading.temp, reading.hum);\n        } else {\n            ReportSensorFault();  /* 1 秒内没有收到新数据 —— 传感器故障 */\n        }\n    }\n}\n\n// 重构代价分析：\n// + 优点：线程安全（值传递）、有流量控制、可测试、数据流清晰可追踪\n// + 缺点：RAM 增加 4 × 12 bytes = 48 bytes（队列 + struct），每帧有 memcpy 开销\n// + 代价：对于 RAM 紧张的系统（< 4KB），48 bytes 是显著开销；memcpy 在 Cortex-M0+ 上约 3μs",
-      "pitfalls": ["【重构后队列满了静默丢数据】触发：xQueueSend timeout=0 时队列满直接返回 pdFAIL 不报警 → 症状：数据静默丢失，没有错误日志 → 修复：检查 xQueueSend 返回值，失败时递增统计计数器并在调试时触发 LED 闪烁", "【struct 对齐导致 memcpy 后解析错位】触发：SensorReading_t 在不同编译选项下 padding 不同（比如 -O0 vs -O2） → 症状：temp 读取正确但 hum 永远是 0.0 → 修复：在 struct 开头加 #pragma pack(push, 1) 或在 FreeRTOSConfig.h 中确保编译器对齐一致", "【ISR 中调用 xTaskGetTickCount()】触发：FreeRTOSConfig.h 中 configUSE_TICKLESS_IDLE=1 但 ISR 仍调用了 tick 相关 API → 症状：tick 值在低功耗模式下不变，timestamp 失去意义 → 修复：ISR 中使用 HAL_GetTick()（底层读取 SysTick 寄存器，不受 tickless 影响）"],
-      "refBook": ["《重构》ch.2『代码坏味道』", "《UNIX编程艺术》ch.2『模块原则』", "《C语言接口与实现》ch.2『抽象数据类型与信息隐藏』"]
+      "tags": [
+        "DMA",
+        "重构",
+        "HAL回调",
+        "代码坏味道",
+        "轮询"
+      ],
+      "explanation": "「重构不是重写，而是逐步改进。」——《重构》ch.1『第一个重构：Simplifying Conditional Expressions』，把轮询 DMA 标志码改成基于 HAL 回调的事件驱动架构，不是推翻重来，而是把代码从「被动等待硬件」变成「硬件通知 CPU」，每一步改动都可以编译通过并测试。",
+      "content": "下面展示一个典型的嵌入式项目中，用轮询方式检查 DMA 传输完成标志的代码，以及如何重构为基于 HAL 回调的事件驱动架构。\n\n改进前的代码坏味道（Smells）：\n1. 忙等待（Busy-Wait）：`while(!(__HAL_DMA_GET_FLAG(hdma, DMA_FLAG_TC)))` 导致 CPU 空转，浪费电量且阻塞其他任务\n2. 寄存器级操作散落在业务代码中：UART 处理逻辑和 DMA 标志清除混在一起，违反单一职责原则\n3. 没有错误处理：DMA 传输失败（如总线冲突）时没有任何检测，代码静默失败\n4. 不可复用：每个需要 DMA 的地方都要复制相同的标志轮询代码，违反 DRY 原则\n\n改进后的架构：\n1. DMA 配置时注册回调函数（HAL 内部通过 hdma->XferCpltCallback 注册）\n2. 数据到达后通过回调通知处理层，CPU 不需要轮询\n3. 增加错误回调（HAL_DMA_ErrorCallback），可以检测传输超时、总线错误\n4. 封装成独立的 RingBuffer 模块，UART 处理逻辑只依赖 RingBuffer_API，不直接接触 DMA\n\n代价：回调函数增加了间接层，调试时需要跨越函数边界追踪数据流。但对于 4+ 字节以上的 UART 数据流，这种间接性是必要的——你不可能用轮询处理 115200 波特率的持续数据流。",
+      "code": "// ========== 改进前：轮询 DMA 标志 ==========\n// 问题：CPU 空转等待，DMA 标志清除逻辑和业务逻辑耦合\n\nvoid ProcessUartData_Raw(void) {\n    /* 启动 DMA 传输 */\n    HAL_UART_Receive_DMA(&huart2, uartRxBuf, UART_BUF_SIZE);\n\n    /* 忙等 DMA 传输完成 —— CPU 完全浪费在这里 */\n    while (__HAL_DMA_GET_FLAG(&hdma_usart2_rx, DMA_FLAG_TC) == RESET) {\n        /* 什么也不做，纯 CPU 浪费 */\n    }\n\n    /* DMA 完成后才处理数据 —— 此时 UART 可能已经收到了新数据 */\n    uint16_t len = UART_BUF_SIZE - hdma_usart2_rx.Instance->NDTR;\n\n    /* 清除 DMA 标志 —— 和业务逻辑混在一起 */\n    __HAL_DMA_CLEAR_FLAG(&hdma_usart2_rx, DMA_FLAG_TC);\n\n    /* 解析帧 —— 这段代码应该在不阻塞 CPU 的地方执行 */\n    if (len > 0) {\n        ParseAndProcess(uartRxBuf, len);\n    }\n}\n\n// ========== 改进后：HAL 回调事件驱动 ==========\n\n/* 环形缓冲区模块 —— 封装 DMA 操作 */\n#define RING_BUF_SIZE  256\nstatic uint8_t __ALIGNED(4) dmaRingBuf[RING_BUF_SIZE];\nstatic volatile uint16_t dmaWriteIdx = 0;\nstatic volatile uint16_t cpuReadIdx = 0;\nstatic volatile uint8_t  bufReady = 0;\n\n/* 环形缓冲区核心 API */\nstatic uint16_t RingBuf_GetAvailable(void) {\n    return dmaWriteIdx - cpuReadIdx;\n}\n\nstatic uint16_t RingBuf_Read(uint8_t *out, uint16_t maxLen) {\n    uint16_t avail = RingBuf_GetAvailable();\n    uint16_t toRead = (maxLen < avail) ? maxLen : avail;\n    for (uint16_t i = 0; i < toRead; i++) {\n        out[i] = dmaRingBuf[(cpuReadIdx + i) & (RING_BUF_SIZE - 1)];\n    }\n    cpuReadIdx += toRead;\n    return toRead;\n}\n\n/* DMA 传输完成回调 —— 只有这个函数能修改 dmaWriteIdx */\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    if (huart->Instance == UART2) {\n        /* DMA TC 触发：获取实际接收长度 */\n        uint16_t transferred = RING_BUF_SIZE - hdma_usart2_rx.Instance->NDTR;\n\n        /* 只更新 write_idx —— 这是唯一能修改它的地方 */\n        dmaWriteIdx += transferred;\n\n        /* 标记有数据可读 */\n        bufReady = 1;\n    }\n}\n\n/* 处理任务 —— 非阻塞地从缓冲区读取数据 */\nvoid vUartProcessTask(void *pvParameters) {\n    uint8_t frame[RING_BUF_SIZE];\n\n    for (;;) {\n        if (bufReady && RingBuf_GetAvailable() > 0) {\n            uint16_t len = RingBuf_Read(frame, RING_BUF_SIZE);\n            bufReady = 0;\n\n            /* 处理完整帧 —— 不阻塞 DMA */\n            ParseAndProcess(frame, len);\n        }\n\n        /* 让出 CPU 给其他任务 */\n        vTaskDelay(pdMS_TO_TICKS(10));\n    }\n}",
+      "pitfalls": [
+        "【回调函数中调用阻塞 API】触发：HAL_UART_RxCpltCallback 中调用 vTaskDelay() 或 HAL_Delay() → 症状：中断上下文调用了 RTOS 阻塞函数，触发 HardFault（Freertos 的 xQueueSend 在 ISR 中不能用带等待参数的版本） → 修复：回调函数中只做数据搬运和标志设置，数据处理移到 Task 中执行",
+        "【环形缓冲区索引溢出回绕】触发：dmaWriteIdx 累加后 unsigned short 溢出（超过 65535），但 cpuReadIdx 没跟上 → 症状：RingBuf_GetAvailable() 返回错误的大值，Read 函数读到缓冲区外的数据 → 修复：使用 uint32_t 存储索引，利用减法特性：available = write_idx - read_idx，即使溢出也能得到正确差值",
+        "【DMA 缓冲区未开启 Cache 一致性处理】触发：STM32H7（Cortex-M7）有 D-Cache，DMA 直接访问 RAM 但 CPU 读取 Cache 副本 → 症状：DMA 写的数据 CPU 读不到（Cache 未 Invalidate），表现为 UART 数据偶尔正确偶尔错误 → 修复：在 DMA 传输完成回调中调用 SCB_InvalidateDCache_by_Addr(dmaRingBuf, RING_BUF_SIZE)"
+      ],
+      "refBook": [
+        "《重构》ch.1『第一个重构』",
+        "《UNIX编程艺术》ch.2『模块原则』",
+        "《C语言接口与实现》ch.2『抽象数据类型』"
+      ]
     }
   ]
 }
