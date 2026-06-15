@@ -1,0 +1,52 @@
+{
+  "date": "2026-06-15",
+  "items": [
+    {
+      "mode": "architecture",
+      "topic": "嵌入式分层架构 vs 后端分层架构的本质差异",
+      "content": "后端开发习惯的四层架构（Controller → Service → Repository → DB）在嵌入式系统中直接平移，往往导致反效果。后端分层的核心假设是：内存充足、异常可回滚、网络调用可重试。这些假设在嵌入式里几乎全不成立。嵌入式分层的第一原则不是「职责分离」，而是「资源隔离」。",
+      "pitfalls": [],
+      "code": null,
+      "explanation": "后端分层追求的是可测试性和团队并行开发，嵌入式分层追求的是确定性。一个典型的错误：在 MCU 上搞出 DAO 层来封装 SPI 访问——SPI 调用本身就不可重试，DAO 多一层只是增加了栈开销，对测试毫无帮助（SPI 驱动本身不可 mock），反而让调用链从 2 层变成 4 层。嵌入式分层应该围绕资源域来划分：传感器域、通信域、执行器域，每个域内部自己负责抽象，域之间通过事件总线交互，而不是套用一个通用的四层模板。",
+      "refBook": "《UNIX编程艺术》第 2.4 节：\"模块化是边界问题，不是职责划分。好的模块边界在需求变化时保持稳定。\""
+    },
+    {
+      "mode": "snippet",
+      "topic": "事件总线解耦模块间通信",
+      "code": "/* 事件总线接口定义 */\ntypedef void (*event_handler_t)(\n    const void *payload);\n\ntypedef struct {\n    uint8_t id;\n    const char *name;\n} event_id_t;\n\ntypedef struct {\n    event_handler_t handlers[16];\n    uint8_t count;\n} event_bus_t;\n\n/* 发布事件 */\nstatic inline void event_publish(\n    event_bus_t *bus,\n    const void *payload)\n{\n    for (int i = 0; i < bus->count; i++) {\n        if (bus->handlers[i]) {\n            bus->handlers[i](payload);\n        }\n    }\n}\n\n/* 注册回调 */\nstatic inline void event_subscribe(\n    event_bus_t *bus,\n    event_handler_t h)\n{\n    if (bus->count < 16) {\n        bus->handlers[bus->count++] = h;\n    }\n}\n\n/* 使用示例 */\nstatic void adc_convert_done(\n    const void *payload)\n{\n    const sample_t *s = payload;\n    pid_update(&pid_ctx, s->value);\n}\n\nstatic event_bus_t system_bus;\n\nvoid system_init(void)\n{\n    event_subscribe(&system_bus,\n                    adc_convert_done);\n}",
+      "explanation": "通过事件总线替代函数直调，实现传感器模块与控制模块之间的零耦合。各模块只关心自己订阅的事件，不需要知道发布者是谁。这种模式在 FreeRTOS 场景下可扩展为队列+任务的通知机制。"
+    },
+    {
+      "mode": "tip",
+      "topic": "嵌入式分层过度设计的三个陷阱",
+      "pitfalls": [
+        {
+          "name": "DAO 模式在 SPI 驱动上的误用",
+          "trigger": "为 SPI/I2C 读写封装 DAO/Repository 层",
+          "symptom": "调用链加深到 4-5 层栈帧，每个中间层传递上下文结构体，栈溢出风险上升",
+          "fix": "SPI/I2C 属于硬件域，直接调用 HAL/LL 即可。需要 mock 时用预处理器宏切换实现，而非 DAO 抽象"
+        },
+        {
+          "name": "依赖倒置在嵌入式中的滥用",
+          "trigger": "在低层模块（如定时器驱动）里定义接口让高层模块实现回调",
+          "symptom": "中断上下文里调用高层回调函数，导致中断延迟不可预测，高优先级任务被阻塞",
+          "fix": "回调函数必须在 ISR 约束下编写：不能 malloc，不能阻塞，执行时间要可量化。优先使用事件发布而非直接函数回调"
+        },
+        {
+          "name": "面向接口编程的过早应用",
+          "trigger": "只有一个实现时先定义 interface_t + 工厂函数",
+          "symptom": "项目中期发现接口从未被替换过，但抽象层的间接寻址增加了 20-30 字节的 flash 开销和一次函数调用开销",
+          "fix": "Rule of Three：等第三次需要不同实现时再抽象。在此之前，用命名空间前缀（如 sensor_v2_read()）模拟模块边界"
+        }
+      ],
+      "explanation": "这三个陷阱的共同根因是：把后端开发的架构经验当成正交的最佳实践，忽略了嵌入式系统的核心约束——确定性、资源限制、不可回滚。分层在嵌入式里的价值不是可测试性，而是资源边界和更新域隔离。"
+    },
+    {
+      "mode": "refactor",
+      "topic": "从函数直调到事件驱动的模块解耦",
+      "code_before": "/* 改造前：传感器模块直接调用控制模块 */\n\n/* sensor.c */\nextern void pid_update(float value);\n\nvoid sensor_task(void)\n{\n    while (1) {\n        float v = adc_read();\n        pid_update(v);\n        vTaskDelay(pdMS_TO_TICKS(10));\n    }\n}",
+      "code_after": "/* 改造后：传感器只发布事件 */\n\n/* sensor.c */\nextern void event_publish(\n    event_bus_t *bus,\n    const void *payload);\n\nstatic const event_id_t EVT_ADC_READY =\n    { .id = 42, .name = \"ADC_READY\" };\n\nvoid sensor_task(void)\n{\n    sample_t sample;\n    while (1) {\n        sample.value = adc_read();\n        event_publish(&system_bus,\n                      &sample);\n        vTaskDelay(pdMS_TO_TICKS(10));\n    }\n}\n\n/* control.c */\nstatic void on_adc_ready(\n    const void *payload)\n{\n    const sample_t *s = payload;\n    pid_update(&pid_ctx, s->value);\n}\n\nvoid control_init(void)\n{\n    event_subscribe(&system_bus,\n                    on_adc_ready);\n}",
+      "impact": "改造前传感器模块硬依赖控制模块的 pid_update()，两个模块编译时耦合，无法独立编译和测试。改造后传感器只依赖事件总线接口，控制模块通过订阅被动接收数据。新增电机模块只需要也订阅 EVT_ADC_READY 事件，传感器代码无需修改。代价：事件总线增加约 64 字节的 RAM 开销（16 个函数指针），以及每次发布时的遍历开销（最坏 16 次函数调用），在 72MHz Cortex-M3 上约 2-3 微秒，完全可接受。"
+    }
+  ]
+}
