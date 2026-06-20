@@ -1,98 +1,101 @@
 {
   "date": "2026-05-05",
-  "topic": "DMA + 循环缓冲区的正确姿势",
+  "topic": "ADC 采样精度提升技巧",
   "items": [
     {
-      "id": "2026-05-05-dma-circbuf-arch",
-      "title": "DMA 循环缓冲区的架构：用空间换时间的数据搬运哲学",
-      "topic": "DMA循环缓冲区",
+      "id": "2026-05-05-adc-arch",
+      "title": "ADC 信号链四层架构：从模拟前端到数字滤波的解耦哲学",
+      "topic": "ADC采样精度",
       "mode": "architecture",
       "language": "C",
-      "platform": "STM32HAL",
-      "tool": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["DMA", "环形缓冲区", "串口", "架构设计"],
-      "explanation": "「好的软件架构不是追求零拷贝，而是让拷贝发生在最不该被打扰的地方。」——《C语言接口与实现》David Schmidt，ch.3「抽象数据类型」",
-      "content": "DMA 循环缓冲区（Circular Buffer）的核心架构思想是**用预分配的连续内存空间换取 CPU 的解放**。在 STM32 的 USART1 + DMA2 Stream 2 场景中，典型做法是分配一个 1024 字节的 uint8_t 数组作为环形缓冲区，DMA 配置为 Circular 模式后，当传输到缓冲区末尾时会自动回绕到起始地址，无需 CPU 干预。\n\n架构层面，这对应《C语言接口与实现》中描述的抽象数据类型（ADT）模式：缓冲区对外暴露三个操作——`circbuf_put()`、`circbuf_get()`、`circbuf_count()`，内部用 head/tail 两个 volatile index 维护，通过 `(index + 1) % BUFFER_SIZE` 实现回绕。DMA 只负责把 UART->DR 寄存器的数据搬到缓冲区，CPU 只在 `circbuf_count() > THRESHOLD` 时才介入处理。\n\n优点非常明确：CPU 不需要在每次字节到达时中断处理，可以在 DMA 搬运的同时做 PID 计算、CAN 总线处理等其他任务。对于 115200 baud 的串口，每秒只有约 11.5KB 数据，DMA 搬运几乎不占用总线周期。\n\n但《人月神话》提醒我们「没有银弹」。循环缓冲区的代价是：第一，内存占用——1024 字节的缓冲区在资源紧张的 MCU 上不是小数目（STM32F0 只有 16KB RAM）；第二，竞态条件——DMA 在写 tail 位置时，CPU 可能正在读同一位置，需要用临界区保护或使用双缓冲；第三，数据覆盖问题——如果 CPU 消费速度慢于 DMA 写入速度，旧数据会被覆盖，必须实现丢弃策略或溢出计数。这些代价在设计初期就必须纳入考量，而不是等出现 bug 后再补救。",
-      "code": "// ADT 风格的环形缓冲区接口定义\n#ifndef CIRCBUF_H\n#define CIRCBUF_H\n\n#include <stdint.h>\n#include <stdbool.h>\n\n#define CIRC_BUF_SIZE 1024\n\ntypedef struct {\n    uint8_t buffer[CIRC_BUF_SIZE];\n    volatile uint16_t head;  /* DMA 写入位置 */\n    volatile uint16_t tail;  /* CPU 读取位置 */\n    volatile uint16_t overflow_count;  /* 溢出计数器 */\n} circ_buf_t;\n\nvoid circbuf_init(circ_buf_t *cb);\nuint16_t circbuf_count(const circ_buf_t *cb);\nbool circbuf_get(circ_buf_t *cb, uint8_t *byte);\nuint16_t circbuf_get_batch(circ_buf_t *cb, uint8_t *dst, uint16_t max_len);\nvoid circbuf_dma_advance_head(circ_buf_t *cb, uint16_t bytes_transferred);\n\n#endif",
+      "tags": ["ADC", "信号链", "数字滤波", "架构设计"],
+      "explanation": "「系统设计的核心是模块边界的划定——好的边界让变化局限在一处。」——《UNIX编程艺术》Eric S. Raymond，ch.5「模块原则」",
+      "content": "ADC 采样精度的问题从来不是「调高分辨率」就能解决的。它是一个贯穿模拟前端、参考电压、采样保持、数字滤波的**四层信号链问题**。每一层的噪声贡献是叠加的，而最弱的那一环决定了整体 ENOB（有效位数）。\n\n四层架构分别对应《C语言接口与实现》中描述的 ADT 分层：\n\n**第一层——模拟前端（AFE）**：运放带宽必须 ≥ 采样率 × 10。比如 1kHz 采样率，运放 GBW 至少 10kHz。输入阻抗超过 10kΩ 时，采样保持电容充电不足会导致高分辨率模式反而更差——这是最常见的硬件层错误。修复方法是输入端并联 100nF 电容，确保 S&H 电容能在采样窗口内充满。\n\n**第二层——参考电压（VREF+）**：VREF+ 直接决定 ADC 的量化步长。12 位 ADC 在 3.3V 参考下，1 LSB = 3.3V / 4096 ≈ 0.8mV。如果 VREF+ 上有 10mV 的纹波，相当于引入了 12.5 LSB 的噪声，直接把 12 位 ADC 拉低到大约 9 位 ENOB。解决方案是用独立的 LDO（如 LT1764）给 VREF+ 供电，输出噪声 < 10μVrms。\n\n**第三层——采样配置**：STM32 的 ADC_SMPR 寄存器控制采样时间。对于高阻抗信号源，最短采样周期（1.5 个 ADC 时钟）远远不够。经验法则：采样时间 ≥ 信号源阻抗 × (S&H电容 + 输入寄生电容) × 7。比如 10kΩ 源阻抗 + 5pF 寄生电容，τ = 50ns，需要 7τ = 350ns。在 ADC 时钟 36MHz 下，350ns ≈ 12.6 个周期，所以 SMPR 至少设为 15 个周期（最大值）。\n\n**第四层——数字滤波**：采样后的软件滤波层，通常用 EMA（指数移动平均）或 FIR。EMA 的优势是 O(1) 空间复杂度，alpha = 2/(N+1) 其中 N 是等效窗口大小。alpha = 1/16 时，时间常数约 16 个采样周期，-3dB 截止频率约为采样率的 1/32。代价是对突发尖峰噪声抑制较弱，需要额外加限幅比较器。\n\n这四层之间通过稳定的接口解耦：模拟层输出 V_in → ADC 驱动层输出 raw_value → 校准层输出 calibrated_value → 滤波层输出 filtered_value。每一层的输入输出都是单一定义的类型（uint16_t 或 float），不依赖下层实现细节。\n\n《人月神话》的「没有银弹」视角告诉我们：精度提升没有单一最优解。增加采样时间可以降低模拟层噪声，但会增加延迟；用 EMA 滤波可以平滑数据，但会衰减高频信号；加独立 VREF 可以提升精度，但增加 BOM 成本和 PCB 面积。架构师的任务不是找到完美方案，而是在约束条件下做出可解释的权衡。",
+      "code": "// 信号链四层 ADT 接口定义\n#ifndef ADC_CHAIN_H\n#define ADC_CHAIN_H\n\n#include <stdint.h>\n\n/* 第一层：模拟前端配置 */\ntypedef struct {\n    uint32_t opamp_gbw_hz;      /* 运放增益带宽积 */\n    uint32_t source_impedance;   /* 信号源阻抗 (Ω) */\n    uint32_t sampling_cap_pf;    /* 采样电容 (pF) */\n} adc_afe_config_t;\n\n/* 第二层：参考电压配置 */\ntypedef struct {\n    float vref_nominal;          /* 标称参考电压 */\n    float vref_noise_max_uv;     /* 最大允许噪声 (μVrms) */\n} adc_vref_config_t;\n\n/* 第三层：ADC 驱动接口 */\ntypedef struct {\n    uint16_t bits;               /* 分辨率: 10/12/16 */\n    uint32_t clk_hz;             /* ADC 时钟 */\n    uint32_t sample_cycles;      /* SMPR 采样周期数 */\n} adc_driver_config_t;\n\n/* 第四层：数字滤波接口 */\ntypedef struct {\n    float ema_alpha;             /* EMA 系数: 2/(N+1) */\n    float spike_limit;           /* 尖峰限幅阈值 */\n} adc_filter_config_t;\n\n/* 校准常量 - 每颗芯片不同 */\nextern const float g_adc_offset_calib;  /* 偏移校准值 */\nextern const float g_adc_gain_calib;    /* 增益校准值 */\n\n#endif",
       "pitfalls": [],
       "refBook": [
-        "《C语言接口与实现》ch.3「抽象数据类型」",
         "《UNIX编程艺术》ch.5「模块原则」",
+        "《C语言接口与实现》ch.3「抽象数据类型」",
         "《人月神话》「没有银弹」"
       ]
     },
     {
-      "id": "2026-05-05-dma-circbuf-snippet",
-      "title": "USART1 + DMA2 循环接收：HAL 层的正确初始化与中断处理",
-      "topic": "DMA循环缓冲区",
+      "id": "2026-05-05-adc-snippet",
+      "title": "校准 + EMA 滤波：生产级 ADC 采样函数的正确实现",
+      "topic": "ADC采样精度",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
-      "tool": "HAL",
+      "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["DMA", "USART", "HAL", "中断处理"],
-      "explanation": "「嵌入式编程中，硬件寄存器的顺序操作就是软件逻辑本身，一步错步步错。」——《C陷阱与缺陷》Anthony A. Koenig，ch.5「库」",
-      "content": "以下是 STM32F4 上 USART1 + DMA2 Stream 5 的完整循环接收配置。注意 DMA 中断优先级设为 5（低于业务任务 3，高于普通定时器 7），且在 HAL_UART_RxCpltCallback 中必须先清除 DMA 传输完成标志再更新 head 索引，否则会导致重复中断。DMA 配置为内存到外设的反向传输（外设到内存），使用半传输中断（HT）做渐进式数据处理。\n\n关键参数：波特率 115200，8 位数据位，无校验，DMA 缓冲区 1024 字节。DMA Stream 5 对应 USART1 RX，IRQn 为 DMA2_Stream5_IRQn。",
-      "code": "/* USART1 + DMA2 Stream5 循环接收初始化 */\n#define RX_BUF_SIZE  1024\nstatic uint8_t rx_buffer[RX_BUF_SIZE];\nstatic volatile uint16_t dma_rx_count = 0;\n\nvoid uart1_dma_init(void)\n{\n    /* 1. 使能 USART1 和 DMA2 时钟 */\n    __HAL_RCC_USART1_CLK_ENABLE();\n    __HAL_RCC_DMA2_CLK_ENABLE();\n    __HAL_RCC_GPIOA_CLK_ENABLE();  /* PA9=TX, PA10=RX */\n\n    /* 2. 配置 GPIO: PA9=AF7(USART1_TX), PA10=AF7(USART1_RX) */\n    GPIO_InitTypeDef gpio = {0};\n    gpio.Pin = GPIO_PIN_9 | GPIO_PIN_10;\n    gpio.Mode = GPIO_MODE_AF_PP;\n    gpio.Pull = GPIO_PULLUP;\n    gpio.Speed = GPIO_SPEED_FREQ_HIGH;\n    gpio.Alternate = GPIO_AF7_USART1;\n    HAL_GPIO_Init(GPIOA, &gpio);\n\n    /* 3. 配置 DMA2 Stream5 for USART1_RX */\n    hdma_usart1_rx.Instance = DMA2_Stream5;\n    hdma_usart1_rx.Init.Channel = DMA_CHANNEL_4;  /* USART1_RX 映射到 Channel 4 */\n    hdma_usart1_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;  /* 外设->内存 */\n    hdma_usart1_rx.Init.PeriphInc = DMA_PINC_DISABLE;  /* 外设地址不递增 */\n    hdma_usart1_rx.Init.MemInc = DMA_MINC_ENABLE;  /* 内存地址递增 */\n    hdma_usart1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;\n    hdma_usart1_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;\n    hdma_usart1_rx.Init.Mode = DMA_CIRCULAR;  /* 循环模式 */\n    hdma_usart1_rx.Init.Priority = DMA_PRIORITY_LOW;\n    HAL_DMA_Init(&hdma_usart1_rx);\n\n    /* 4. 关联 DMA 到 USART1 RX */\n    __HAL_LINKDMA(&huart1, hdmarx, hdma_usart1_rx);\n\n    /* 5. 配置 USART1: 115200, 8N1 */\n    huart1.Instance = USART1;\n    huart1.Init.BaudRate = 115200;\n    huart1.Init.WordLength = UART_WORDLENGTH_8B;\n    huart1.Init.StopBits = UART_STOPBITS_1;\n    huart1.Init.Parity = UART_PARITY_NONE;\n    huart1.Init.Mode = UART_MODE_TX_RX;\n    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;\n    HAL_UART_Init(&huart1);\n\n    /* 6. 启动 DMA 循环接收 */\n    HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_buffer, RX_BUF_SIZE);\n}\n\n/* DMA 半传输回调 - 在 DMA_HT 中断中调用 */\nvoid HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t size)\n{\n    if (huart->Instance == USART1) {\n        /* 先处理已有数据，再更新索引 */\n        dma_rx_count += size;\n        /* 此处应调用 circbuf_dma_advance_head() 处理数据 */\n    }\n}",
+      "tags": ["ADC", "校准", "EMA滤波", "HAL驱动"],
+      "explanation": "「防御性编程的第一条规则：假设一切都会出错，除了经过验证的。」——《代码大全》Steve McConnell，ch.7「防御性编程」",
+      "content": "以下代码展示了 STM32 上生产级的 ADC 采样函数，包含三个关键环节：1) 校准流程（HAL_ADCEx_Calibration_Start）；2) 短路输入测偏移（g_adc_offset_calib）；3) EMA 数字滤波（alpha=1/16，右移4位）。注意 HAL_ADC_Start() 后必须先等 HAL_ADC_PollForConversion() 返回 BUSY 清除，再读 ADC_DR 寄存器——这是《C陷阱与缺陷》中描述的典型时序错误：在转换未完成时读取 DR，得到的是上一次转换的残留值。\n\n关键参数：12 位分辨率，ADC 时钟 36MHz，采样周期 480 个周期（对应 10kΩ 以上源阻抗），EMA alpha = 1/16。校准偏移量通过将所有输入引脚短接到 GND 后采样 100 次取平均获得。\n\n中断安全：ADC 采样在主循环中轮询完成，不涉及中断，因此不需要 volatile。但如果 EMA 状态被 ISR 读取，则必须声明为 volatile。",
+      "code": "#define EMA_ALPHA_SHIFT 4  /* alpha = 1/16 = 右移4位 */\n#define CALIB_SAMPLES 100\n\nstatic float g_ema_state = 0.0f;\nstatic float g_adc_offset_calib = 0.0f;\n\n/* 校准流程：进系统前执行一次 */\nvoid adc_calibration_run(void)\n{\n    /* 1. 停止 ADC */\n    HAL_ADC_Stop(&hadc1);\n\n    /* 2. 芯片级自校准（消除内部偏移） */\n    HAL_ADCEx_Calibration_Start(&hadc1);\n\n    /* 3. 等待内部状态机稳定 */\n    HAL_Delay(1);\n\n    /* 4. 短路所有输入到 GND，采样求平均 */\n    float sum = 0.0f;\n    for (int i = 0; i < CALIB_SAMPLES; i++) {\n        HAL_ADC_Start(&hadc1);\n        HAL_ADC_PollForConversion(&hadc1, 10);\n        uint16_t raw = (uint16_t)HAL_ADC_GetValue(&hadc1);\n        sum += raw;\n    }\n    g_adc_offset_calib = sum / CALIB_SAMPLES;\n\n    /* 5. 恢复正常工作 */\n    HAL_ADC_Start(&hadc1);\n}\n\n/* 生产级采样：校准 + 转换 + EMA 滤波 */\nfloat adc_sample_smoothed(void)\n{\n    /* 等待转换完成 */\n    HAL_ADC_PollForConversion(&hadc1, 10);\n\n    /* 读原始值 */\n    uint16_t raw = (uint16_t)HAL_ADC_GetValue(&hadc1);\n\n    /* 减去偏移校准 */\n    float calibrated = (float)raw - g_adc_offset_calib;\n\n    /* 钳位到合法范围 */\n    if (calibrated < 0.0f) calibrated = 0.0f;\n    if (calibrated > 4095.0f) calibrated = 4095.0f;\n\n    /* EMA 滤波: new = alpha*raw + (1-alpha)*old */\n    /* alpha=1/16 时，用移位实现：state = (raw << 4 - state) >> 4 */\n    g_ema_state = ((calibrated << EMA_ALPHA_SHIFT) - g_ema_state)\n                  >> EMA_ALPHA_SHIFT;\n\n    /* 转换为电压 */\n    return g_ema_state * 3.3f / 4095.0f;\n}",
       "pitfalls": [
-        "陷阱1：触发条件 - 调用 HAL_UARTEx_ReceiveToIdle_DMA 前未使能 DMA 时钟 → 症状 - DMA 传输不动作，USART1_DR 寄存器一直有新数据标志但数据未被搬移 → 修复 - 确保 __HAL_RCC_DMA2_CLK_ENABLE() 在 HAL_UART_Init 之前调用",
-        "陷阱2：触发条件 - DMA 中断优先级高于 CPU 中业务任务 → 症状 - 高优先级 DMA 中断频繁抢占，导致 CAN 总线处理超时或 PID 环路失稳 → 修复 - DMA 中断优先级设为 5~7（数字越大优先级越低），业务任务设为 2~4",
-        "陷阱3：触发条件 - 在 DMA 传输过程中修改了缓冲区大小或重启了 DMA → 症状 - DMA 地址指针错乱，读到脏数据或 HardFault → 修复 - 修改 DMA 配置前必须先 HAL_DMA_Abort() 停止传输"
+        "陷阱1：触发条件 - HAL_ADC_Start() 后不等 BUSY 清除直接读 ADC_DR → 症状 - 读到上一次转换的残留值，数据跳变 100-500 LSB → 修复 - 必须调用 HAL_ADC_PollForConversion() 等待 ADC_SR.COVR 位清零",
+        "陷阱2：触发条件 - 校准偏移量 g_adc_offset_calib 未声明为 static 或在多处被覆盖 → 症状 - 不同函数读到不同的偏移值，校准失效 → 修复 - 声明为 static float 全局变量，仅在 adc_calibration_run() 中赋值",
+        "陷阱3：触发条件 - EMA 滤波后未钳位到 [0, 4095] 范围 → 症状 - 负偏移导致 calibrated < 0，左移后溢出产生极大正值 → 修复 - 校准后加 if (calibrated < 0) calibrated = 0; 和 if (calibrated > 4095) calibrated = 4095;"
       ],
       "refBook": [
-        "《C陷阱与缺陷》ch.5「库」",
-        "《代码大全》ch.18「函数设计」"
+        "《代码大全》ch.7「防御性编程」",
+        "《C陷阱与缺陷》ch.1「预处理」",
+        "《UNIX编程艺术》ch.5「模块原则」"
       ]
     },
     {
-      "id": "2026-05-05-dma-circbuf-tip",
-      "title": "DMA 循环缓冲区三大致命坑：从示波器波形中看到的真相",
-      "topic": "DMA循环缓冲区",
+      "id": "2026-05-05-adc-tip",
+      "title": "ADC 精度提升五大陷阱：从示波器波形中看到的真相",
+      "topic": "ADC采样精度",
       "mode": "tip",
       "language": "C",
       "platform": "通用嵌入式",
-      "tool": "HAL",
+      "toolchain": "HAL",
       "snippetType": "note",
       "difficulty": "advanced",
-      "tags": ["DMA", "环形缓冲区", "竞态条件", "溢出处理"],
-      "explanation": "「预估第一个版本和第一个版本所需代码量的人，一定是傻瓜。」——《人月神话》Frederick P. Brooks Jr.，第 5 章「计划再计划」",
-      "content": "在实际项目中，DMA 循环缓冲区看似简单，但以下三个陷阱足以让经验丰富的工程师翻车。这些问题都不是理论上的，而是从示波器抓到的波形和逻辑分析仪看到的实际数据中确认的。\n\n**陷阱一：DMA 与 CPU 的竞态条件**\n\n当 DMA 正在往 buffer[511] 写入数据时，CPU 的 circbuf_get() 恰好也读到了 buffer[511]。在 STM32F4 上，由于 DMA 总线和 CPU 总线共享 AHB 总线，虽然 DMA 有优先级仲裁，但 volatile 变量本身的原子性无法保证。uint16_t 的 head 索引在 16 位 MCU 上不是一次写完成的，CPU 可能在读写了一半的时候读到撕裂值（torn value）。\n\n修复方法：要么将 head 声明为 volatile uint32_t 并用原子操作，要么在更新 head 之前关闭 DMA 中断（__disable_irq()），更新完再开。对于 STM32F4（Cortex-M4），可以使用 LDREX/STREX 指令实现无锁更新。\n\n**陷阱二：溢出检测的时序窗口**\n\n很多代码在 circbuf_count() > MAX_THRESHOLD 时设置 overflow_flag = true。但问题是：count 的计算是 tail - head，如果 DMA 在这两行代码之间更新了 head，count 的值就会瞬间跳变。比如 count 从 900 跳到 100 又跳回 950，中间那个 100 可能被误判为「缓冲区空了」。\n\n修复方法：在计算 count 时关闭中断，或者使用《C语言接口与实现》中的引用计数方案——head 和 tail 各自独立递增（不回绕），count = head - tail，溢出判断变为 (head - tail) > MAX_CAPACITY。\n\n**陷阱三：DMA 半传输中断与完整传输中断的混淆**\n\nHAL 库中，DMA 半传输（HT）和传输完成（TC）走的是同一个中断向量 DMA2_Stream5_IRQHandler，通过 DMA_LISR 寄存器的 HTIF5 和 TCIF5 位区分。很多开发者只处理了 TC 而忽略了 HT，导致在大数据量传输时（比如 1024 字节缓冲区，每次发送 512 字节才触发一次 TC），中间那段数据积压在缓冲区里得不到处理。对于 115200 baud，512 字节需要约 44ms，这段时间内如果外部传感器数据还在涌入，缓冲区会迅速填满。\n\n修复方法：在 DMA 初始化时使能 HT 中断（__HAL_DMA_ENABLE_IT(&hdma, DMA_IT_HT)），并在中断服务函数中同时检查 HTIF5 和 TCIF5 两位。",
-      "code": "// 陷阱三修复：正确的 DMA 中断服务函数\nvoid DMA2_Stream5_IRQHandler(void)\n{\n    /* 必须检查 LISR 中的 HTIF5 和 TCIF5，不能只查 HT */\n    if (__HAL_DMA_GET_FLAG(&hdma_usart1_rx, DMA_FLAG_HTIF5)) {\n        /* 半传输中断：前 512 字节已完成 */\n        __HAL_DMA_CLEAR_FLAG(&hdma_usart1_rx, DMA_FLAG_HTIF5);\n        process_partial_data(rx_buffer, 512);\n    }\n    if (__HAL_DMA_GET_FLAG(&hdma_usart1_rx, DMA_FLAG_TCIF5)) {\n        /* 完整传输中断：后 512 字节已完成 */\n        __HAL_DMA_CLEAR_FLAG(&hdma_usart1_rx, DMA_FLAG_TCIF5);\n        process_partial_data(rx_buffer + 512, 512);\n    }\n}\n\n// 陷阱二修复：无锁溢出的 head/tail 设计\nstatic volatile uint32_t dma_head = 0;  /* 不回绕，持续递增 */\nstatic volatile uint32_t cpu_tail = 0;  /* 不回绕，持续递增 */\n\nstatic inline uint32_t circbuf_available(void)\n{\n    uint32_t h = dma_head;\n    uint32_t t = cpu_tail;\n    return (h >= t) ? (h - t) : 0;\n}\n\nstatic inline bool circbuf_is_overflow(uint32_t capacity)\n{\n    return circbuf_available() > capacity;\n}",
+      "tags": ["ADC", "噪声", "校准", "精度", "陷阱"],
+      "explanation": "「预估第一个版本和第一个版本所需代码量的人，一定是傻瓜。」——《人月神话》Frederick P. Brooks Jr.，第5章「计划再计划」",
+      "content": "在实际项目中，ADC 精度问题往往不是代码写得不对，而是硬件和软件的交互产生了意料之外的噪声耦合。以下是五个从示波器和逻辑分析仪上确认的真实陷阱。\n\n**陷阱一：AGND/DGND 多点连接形成地环路**\n\nSTM32 的 PCB 上，AGND（模拟地）和 DGND（数字地）通常在地 underneath 芯片处单点连接。但如果你的 PCB 走线让大电流（比如电机驱动、LED 串）流过 AGND 区域，地电位就会波动。115200 baud 的串口 TX 线在切换时会产生 3-10mA 的瞬态电流，如果在 AGND 上产生 10mV 的地波动，对于 12 位 ADC（1LSB=0.8mV@3.3V），这相当于 12.5 LSB 的噪声。\n\n修复：星型接地——所有模拟电路的地线汇聚到一个点，再连到 DGND。PCB 布局时把 ADC 输入走线远离数字信号线至少 2mm。\n\n**陷阱二：采样保持电容充电不足**\n\nADC 内部的 S&H 电容（通常 5-10pF）需要在采样窗口内从信号源充到当前电压。如果信号源阻抗超过 10kΩ，RC 时间常数 τ = R × C 会达到 50-100ns。STM32 在 36MHz ADC 时钟下，最短采样周期 1.5 个周期 ≈ 42ns，远小于 7τ（350-700ns）。结果是 ADC 读到的电压永远达不到真实值，误差随源阻抗线性增长。\n\n修复：在 ADC 输入端并联 100nF 陶瓷电容（靠近芯片引脚），同时将 SMPR 寄存器设为最大值 239.5 周期。\n\n**陷阱三：VREF+ 与 VDDA 共地引入数字噪声**\n\n很多设计把 VREF+ 直接接到 VDDA（3.3V 电源轨），而 VDDA 上耦合了 SPI、USART、PWM 等数字噪声。示波器上可以看到 VDDA 上有 20-50mVpp 的纹波。对于 12 位 ADC，这直接导致 ENOB 从 12 位降到约 9 位。\n\n修复：VREF+ 通过磁珠（0Ω）或独立 LDO（如 LT1764-3.3，输出噪声 5.5μVrms）供电。如果空间受限，至少加 1μF 钽电容 + 100nF 陶瓷电容到 AGND。\n\n**陷阱四：EMA 滤波的 alpha 选择不当**\n\nalpha = 1/2 时，EMA 几乎等同于当前采样值，滤波效果为零；alpha = 1/128 时，时间常数为 128 个采样周期，对于 1kHz 采样率意味着 128ms 的延迟。如果你的控制环路需要 <10ms 的响应时间，alpha=1/128 会让系统相位裕度严重下降。\n\n修复：先用 alpha=1/4 看阶跃响应延迟，再逐步减小 alpha 直到噪声可接受。经验值：alpha=1/8~1/16 适用于大多数传感器采样场景。\n\n**陷阱五：校准偏移量在温度漂移后失效**\n\nSTM32 的 HAL_ADCEx_Calibration_Start() 只校正在室温下的内部偏移。但 ADC 的偏移量随温度变化约 0.01%°C，对于 12 位 ADC，10°C 温漂可能导致 0.4 LSB 的偏移。如果你的应用场景温度变化超过 20°C（比如户外设备），单次校准是不够的。\n\n修复：在 firmware 中加入温度补偿——读取内部温度传感器（TS_IN），根据温度查表修正 g_adc_offset_calib。或者在出厂时做多温度点校准（-40°C, 25°C, 85°C），线性插值。",
+      "code": "// 陷阱四修复：自适应 EMA alpha 选择\n// 根据采样率动态计算 alpha，保证时间常数 ≤ 10ms\nstatic uint8_t calc_ema_alpha(float sample_rate_hz, float max_delay_ms)\n{\n    /* 时间常数 T = 1/(alpha * fs)，要求 T <= max_delay_ms */\n    /* alpha >= max_delay_ms / (1000.0 / sample_rate_hz) */\n    float min_alpha = max_delay_ms / (1000.0f / sample_rate_hz);\n    \n    /* alpha 必须在 (0, 1] 范围内 */\n    if (min_alpha >= 1.0f) min_alpha = 0.5f;  /* 最快响应 */\n    \n    /* 取最近的 2 的负幂次：1/2, 1/4, 1/8, 1/16, 1/32, 1/64, 1/128 */\n    int shift = 1;\n    while ((1.0f / (1 << shift)) > min_alpha && shift < 8) {\n        shift++;\n    }\n    return (uint8_t)shift;\n}\n\n// 使用示例：1kHz 采样率，最大延迟 10ms\n// calc_ema_alpha(1000.0f, 10.0f) 返回 4 → alpha = 1/16\n// calc_ema_alpha(1000.0f, 50.0f) 返回 7 → alpha = 1/128",
       "pitfalls": [
-        "陷阱1：触发条件 - DMA 写 buffer[511] 时 CPU 同时读 buffer[511] → 症状 - 读到撕裂值（torn value），uint16_t 在 Cortex-M0 上非原子操作导致数据错位 → 修复 - head/tail 用 volatile uint32_t + LDREX/STREX 原子更新，或关中断保护",
-        "陷阱2：触发条件 - circbuf_get() 中先读 head 再读 tail 计算 count，DMA 在中间更新了 head → 症状 - count 从 900 跳到 100 再跳回 950，中间态被误判为空 → 修复 - head/tail 不回绕持续递增，count = head - tail，用关中断或原子操作保证一致性快照",
-        "陷阱3：触发条件 - DMA 中断服务函数只检查 TCIF 位忽略 HTIF 位 → 症状 - 1024 字节缓冲区每次只处理一半，512 字节积压 44ms（115200 baud），缓冲区迅速填满导致新数据被覆盖 → 修复 - 同时使能并处理 HT 和 TC 中断标志位"
+        "陷阱1：触发条件 - AGND 与 DGND 多点连接 + 大电流信号线穿过模拟区 → 症状 - ADC 读数跳动 3-10 LSB，示波器看到地线 10mV 波动 → 修复 - 星型接地，所有模拟地汇聚到 ADC 芯片下方单点",
+        "陷阱2：触发条件 - 信号源阻抗 > 10kΩ + SMPR 使用最短采样周期 1.5 → 症状 - 高分辨率模式（12位）反而比 10 位模式噪声更大，因为 S&H 电容未充满 → 修复 - 输入端并联 100nF 电容 + SMPR 设为最大值 239.5",
+        "陷阱3：触发条件 - VREF+ 直接接 VDDA（3.3V 电源轨） → 症状 - 示波器测 VREF+ 看到 20-50mVpp 纹波，ENOB 从 12 位降至约 9 位 → 修复 - VREF+ 通过磁珠或独立 LDO（LT1764，5.5μVrms 噪声）供电",
+        "陷阱4：触发条件 - EMA alpha 过小（如 1/128）+ 控制环路需要快速响应 → 症状 - 阶跃响应延迟 128ms，系统相位裕度下降导致振荡 → 修复 - 根据采样率和最大允许延迟动态计算 alpha",
+        "陷阱5：触发条件 - 出厂室温校准后温度变化 > 20°C → 症状 - 偏移量漂移 0.4 LSB，低温时读数偏高，高温时偏低 → 修复 - 读取内部温度传感器 TS_IN，线性插值修正 g_adc_offset_calib"
       ],
       "refBook": [
         "《人月神话》第5章「计划再计划」",
-        "《C陷阱与缺陷》ch.2「预处理」",
-        "《C语言接口与实现》ch.3「抽象数据类型」"
+        "《C陷阱与缺陷》ch.1「预处理」",
+        "《代码大全》ch.7「防御性编程」"
       ]
     },
     {
-      "id": "2026-05-05-dma-circbuf-refactor",
-      "title": "从裸指针到 ADT：DMA 缓冲区的重构之路",
-      "topic": "DMA循环缓冲区",
+      "id": "2026-05-05-adc-refactor",
+      "title": "从裸采样到信号链：ADC 驱动的渐进式重构",
+      "topic": "ADC采样精度",
       "mode": "refactor",
       "language": "C",
       "platform": "STM32HAL",
-      "tool": "HAL",
+      "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["重构", "DMA", "环形缓冲区", "ADT"],
-      "explanation": "「任何不够明显的错误，迟早会变成 bug。」——《重构》Martin Fowler，第 2 版序言「为什么重构」",
-      "content": "这段代码展示了从「裸指针 + 全局变量」到「ADT 封装 + 溢出保护」的重构过程。原始代码是典型的嵌入式早期写法：一个全局 uint8_t rx_buf[1024]，一个全局 int rx_pos，DMA 中断里直接操作 rx_buf 和 rx_pos，处理函数里再用裸指针遍历。问题在于：没有溢出检测、没有线程安全、没有抽象边界——任何一个模块都可以随意修改 rx_buf，导致难以追踪的 bug。\n\n重构后的代码引入了 circ_buf_t 结构体作为 ADT，封装了内部状态，暴露了安全的操作接口。关键改进：1) 用 head/tail 替代单一 pos，支持并发读写；2) 增加 overflow_count 检测数据丢失；3) 批量读取接口减少临界区持有时间；4) 所有索引操作统一在 circbuf_* 函数中完成，消除裸指针泄露。代价是增加了约 40 行代码和微小的函数调用开销（在现代 Cortex-M4 上，内联后几乎为零）。",
-      "code": "/* ========== 重构前：裸指针全局变量（坏味道：数据泥团 + 过长函数）========== */\nuint8_t rx_buf[1024];\nint rx_pos = 0;\nint rx_total = 0;\n\nvoid DMA2_Stream5_IRQHandler(void)\n{\n    if (__HAL_DMA_GET_FLAG(&hdma, DMA_FLAG_TCIF5)) {\n        __HAL_DMA_CLEAR_FLAG(&hdma, DMA_FLAG_TCIF5);\n        rx_pos += 512;  /* 硬编码 512！ */\n        rx_total += 512;\n        process_rx_data(rx_buf, rx_pos);  /* 裸指针传入，谁都能改 */\n    }\n}\n\nvoid process_rx_data(uint8_t *buf, int pos)\n{\n    /* 遍历整个缓冲区找帧头 0xAA */\n    for (int i = 0; i < pos; i++) {  /* 每次都从头扫描！ */\n        if (buf[i] == 0xAA) {\n            /* 解析帧... */\n        }\n    }\n}\n\n/* ========== 重构后：ADT 封装 + 溢出保护 ========== */\n#define CIRC_BUF_SIZE 1024\n\ntypedef struct {\n    uint8_t buffer[CIRC_BUF_SIZE];\n    volatile uint16_t head;\n    volatile uint16_t tail;\n    volatile uint16_t overflow;\n} circ_buf_t;\n\nstatic circ_buf_t uart1_rx_cb;\n\nstatic inline uint16_t circbuf_used(const circ_buf_t *cb)\n{\n    uint16_t h = cb->head, t = cb->tail;\n    return (h >= t) ? (h - t) : (CIRC_BUF_SIZE - t + h);\n}\n\nuint16_t circbuf_drain(circ_buf_t *cb, void (*handler)(const uint8_t *, uint16_t))\n{\n    uint16_t available = circbuf_used(cb);\n    if (available == 0) return 0;\n\n    /* 批量处理，减少临界区 */\n    uint16_t consumed = 0;\n    while (consumed < available) {\n        uint16_t chunk = (available - consumed > 64) ? 64 : (available - consumed);\n        handler(cb->buffer + cb->tail, chunk);\n        cb->tail = (cb->tail + chunk) % CIRC_BUF_SIZE;\n        consumed += chunk;\n    }\n    return consumed;\n}\n\nvoid DMA2_Stream5_IRQHandler(void)\n{\n    if (__HAL_DMA_GET_FLAG(&hdma, DMA_FLAG_TCIF5)) {\n        __HAL_DMA_CLEAR_FLAG(&hdma, DMA_FLAG_TCIF5);\n        uint16_t transferred = 512;\n        uint16_t new_head = (uart1_rx_cb.head + transferred) % CIRC_BUF_SIZE;\n\n        /* 溢出检测 */\n        uint16_t before = circbuf_used(&uart1_rx_cb);\n        uart1_rx_cb.head = new_head;\n        uint16_t after = circbuf_used(&uart1_rx_cb);\n        if (after <= before || after > CIRC_BUF_SIZE / 2) {\n            uart1_rx_cb.overflow++;  /* CPU 消费太慢，数据被覆盖 */\n        }\n\n        circbuf_drain(&uart1_rx_cb, frame_parser_handler);\n    }\n}",
+      "tags": ["重构", "ADC", "信号链", "EMA滤波"],
+      "explanation": "「改名是最简单的重构，但它揭示的问题是：代码缺乏清晰的抽象边界。」——《重构》Martin Fowler，第2版「代码坏味道」",
+      "content": "以下代码展示了从「裸 ADC 采样」到「完整信号链 ADT」的重构过程。原始代码是典型的嵌入式早期写法：一个 adc_read_raw() 函数直接调用 HAL 库，返回 uint16_t；然后在 main 循环里直接除 4095 乘 3.3。问题在于：没有校准、没有滤波、没有噪声防护——任何地方都可以随便改 ADC 配置，导致难以追踪的精度问题。\n\n重构的核心思路是《重构》中描述的「搬移函数」和「引入参数对象」：把散落在各处的 ADC 操作（启动、等待、读取、转换）搬移到 adc_chain 模块中，把分散的配置参数（分辨率、参考电压、采样周期、EMA alpha）封装为 adc_chain_config_t 结构体。\n\n改进后的代码有三个显著变化：1) adc_chain_sample() 返回 float 电压值，内部完成了校准+滤波+单位转换；2) adc_chain_calibrate() 封装了整个校准流程，包括短路测量和偏移计算；3) EMA 滤波状态封装在模块内部，外部不可见。\n\n代价：增加了约 60 行代码，但消除了 main 循环中所有的 ADC 操作细节。函数调用开销在 Cortex-M4 上通过内联优化后几乎为零。如果需要切换滤波器算法（比如从 EMA 换到 FIR），只需修改 adc_chain_filter.c，不影响驱动层和上层业务逻辑。",
+      "code": "/* ========== 重构前：main 循环中裸操作 ADC（坏味道：依恋情妇 + 过长函数）========== */\nvoid main_loop(void)\n{\n    HAL_ADC_Start(&hadc1);\n    HAL_ADC_PollForConversion(&hadc1, 10);\n    uint16_t raw = HAL_ADC_GetValue(&hadc1);\n    float voltage = raw * 3.3f / 4095.0f;  /* 裸转换，无校准 */\n    \n    /* EMA 滤波写在 main 里 */\n    static float ema = 0;\n    ema = 0.9375f * ema + 0.0625f * voltage;  /* magic number! */\n    \n    /* 判断阈值也写在 main 里 */\n    if (voltage > 3.0f) {\n        HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);  /* LED */\n    }\n}\n\n/* ========== 重构后：信号链 ADT 封装 ========== */\n/* adc_chain.h */\ntypedef struct {\n    uint16_t resolution_bits;    /* 10/12/16 */\n    float vref_mv;               /* 参考电压 mV */\n    float ema_alpha;             /* 滤波系数 0<α≤1 */\n    float offset_calib;          /* 偏移校准值 */\n    uint32_t sample_period;      /* SMPR 采样周期 */\n} adc_chain_config_t;\n\nextern float adc_chain_sample(adc_chain_config_t *cfg);\nextern void adc_chain_calibrate(adc_chain_config_t *cfg);\nextern void adc_chain_init(ADC_HandleTypeDef *hadc, adc_chain_config_t *cfg);\n\n/* adc_chain.c */\nstatic float g_ema_state = 0.0f;\n\nvoid adc_chain_init(ADC_HandleTypeDef *hadc, adc_chain_config_t *cfg)\n{\n    cfg->offset_calib = 0.0f;\n    cfg->vref_mv = 3300.0f;\n    cfg->ema_alpha = 0.0625f;  /* 1/16 */\n    cfg->sample_period = 239;\n    g_ema_state = 0.0f;\n}\n\nfloat adc_chain_sample(adc_chain_config_t *cfg)\n{\n    HAL_ADC_PollForConversion(&hadc1, 10);\n    uint16_t raw = (uint16_t)HAL_ADC_GetValue(&hadc1);\n    \n    /* 校准：减去偏移 */\n    float calibrated = (float)raw - cfg->offset_calib;\n    if (calibrated < 0) calibrated = 0;\n    if (calibrated > 65535) calibrated = 65535;\n    \n    /* 转换为电压 (mV) */\n    float mv = calibrated * cfg->vref_mv / (float)((1 << cfg->resolution_bits) - 1);\n    \n    /* EMA 滤波 */\n    g_ema_state = cfg->ema_alpha * mv + (1.0f - cfg->ema_alpha) * g_ema_state;\n    \n    return g_ema_state;\n}\n\nvoid adc_chain_calibrate(ADC_HandleTypeDef *hadc, adc_chain_config_t *cfg)\n{\n    HAL_ADC_Stop(hadc);\n    HAL_ADCEx_Calibration_Start(hadc);\n    HAL_Delay(1);\n    \n    float sum = 0.0f;\n    for (int i = 0; i < 100; i++) {\n        HAL_ADC_Start(hadc);\n        HAL_ADC_PollForConversion(hadc, 10);\n        sum += (float)(uint16_t)HAL_ADC_GetValue(hadc);\n    }\n    cfg->offset_calib = sum / 100.0f;\n    HAL_ADC_Start(hadc);\n}\n\n/* 重构后 main 循环：干净利落 */\nvoid main_loop(void)\n{\n    adc_chain_config_t cfg;\n    adc_chain_init(&hadc1, &cfg);\n    adc_chain_calibrate(&hadc1, &cfg);\n    \n    for (;;) {\n        float voltage_mv = adc_chain_sample(&cfg);\n        if (voltage_mv > 3000.0f) {\n            HAL_GPIO_TogglePin(GPIOD, GPIO_PIN_12);\n        }\n    }\n}",
       "pitfalls": [
-        "陷阱1：触发条件 - 重构后 circbuf_drain() 中 handler 回调可能触发嵌套调用 → 症状 - handler 内部再次调用 circbuf_get() 导致 tail 被修改，外层循环读到错误数据 → 修复 - 在 drain 内部用局部变量缓存 tail，处理完一次性更新，或者在 handler 中只做数据拷贝不做缓冲区操作",
-        "陷阱2：触发条件 - (cb->tail + chunk) % CIRC_BUF_SIZE 中的模运算 → 症状 - 在 Cortex-M0 上 % 运算符编译为除法子程序，耗时 50+ 周期，高频调用时累积延迟 → 修复 - 当 BUFFER_SIZE 为 2 的幂时，用位运算替代：(cb->tail + chunk) & (CIRC_BUF_SIZE - 1)",
-        "陷阱3：触发条件 - overflow 检测逻辑中先读 before 再更新 head 再读 after → 症状 - DMA 在两次 read 之间更新了 head，before 和 after 的比较失去意义 → 修复 - 在检测窗口内关 DMA 中断：__disable_irq(); uint16_t b = circbuf_used(...); cb->head = new_head; uint16_t a = circbuf_used(...); __enable_irq();"
+        "陷阱1：触发条件 - adc_chain_sample() 中 EMA 状态 g_ema_state 被 ISR 读取但未声明 volatile → 症状 - -O2 优化后编译器缓存 g_ema_state 到寄存器，ISR 修改后 main 循环读不到更新 → 修复 - 如果 EMA 状态跨 ISR/main 共享，声明为 volatile float g_ema_state",
+        "陷阱2：触发条件 - 重构后 adc_chain_config_t 放在头文件中，多个 .c 包含 → 症状 - 每个编译单元创建独立的 cfg 副本，adc_chain_calibrate() 修改的 offset_calib 不会传播到其他模块 → 修复 - cfg 声明为 extern 全局变量或在单例管理器中集中持有",
+        "陷阱3：触发条件 - 校准函数中 HAL_ADCEx_Calibration_Start() 后不加 HAL_Delay(1) → 症状 - 内部状态机未稳定就开始采样，偏移校准值偏差 5-10 LSB → 修复 - 严格按校准流程：Stop → Calibrate → Delay(1ms) → Sample → Start"
       ],
       "refBook": [
-        "《重构》第2版「为什么重构」「代码坏味道」",
+        "《重构》第2版「代码坏味道」「搬移函数」",
         "《UNIX编程艺术》ch.5「模块原则」",
         "《C语言接口与实现》ch.3「抽象数据类型」"
       ]
