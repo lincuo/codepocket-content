@@ -1,94 +1,98 @@
 {
   "date": "2026-05-05",
-  "topic": "低功耗设计的几个层次",
+  "topic": "DMA + 循环缓冲区的正确姿势",
   "items": [
     {
-      "id": "2026-05-05-lp-arch",
-      "title": "低功耗设计：四层架构与取舍矩阵",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-arch",
+      "title": "DMA 环形缓冲区：三层架构与 ADT 封装",
+      "topic": "DMA环形缓冲区",
       "mode": "architecture",
       "language": "C",
-      "platform": "STM32HAL",
+      "platform": "通用嵌入式",
       "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["低功耗", "电源管理", "STOP模式", "时钟门控", "策略模式"],
-      "explanation": "「好的架构不是选择最简单的那条路，而是选择最可演进的那条。」——《UNIX编程艺术》第 6 章「设计原则：组合性」。低功耗设计的四层架构（时钟树→电压域→核心睡眠→系统级）本质上是组合性原则的体现：每一层独立工作，组合起来覆盖从 5mA 到 1μA 的功耗带。代价是复杂度线性增长——每多一层电源管理，唤醒后的恢复逻辑就多一组边界条件。",
-      "content": "低功耗设计的核心架构思想是**分层渐进**：从最浅层的时钟门控到最深层的 Standby 模式，每一层解决不同量级的功耗问题，且上层可以组合下层的能力。\n\n第一层——**时钟树门控**（Clock Gating）。这是零成本优化。在 STM32L4 上，每个外设模块的时钟由 RCC_APB2ENR、RCC_APB1ENR 等寄存器独立控制。关闭一个未使用的 SPI2 时钟（RCC_APB1ENR 的 SPI2EN 位置 0），瞬间节省 0.5-2mA。这个方法没有副作用，因为关闭的时钟本来就是闲置的。《C语言接口与实现》第 3 章的抽象数据类型思想在这里体现为：将时钟管理封装为 HAL 接口（__HAL_RCC_xxx_CLK_DISABLE），应用层不需要知道 RCC 寄存器的位偏移。\n\n第二层——**电压域调节**（Voltage Scaling）。STM32L4 支持 Scale 0/1/2/3 四级电压缩放。Scale 3（1.5V Vcore）可将 CPU 频率上限压到 2MHz，同时电流从 5mA 降到约 1mA。代价是 ADC 在低电压下的精度下降（参考电压 VREFINT 的 LSB 变大），且 Flash 在 1.5V 下需要增加等待周期（FLASH_ACR 的 LATENCY 字段从 0 变为 1）。\n\n第三层——**核心睡眠模式**（Core Sleep）。STM32L4 提供 SLEEP、DEEPSLEEP、STOP0/1/2、STANDBY 五种模式，由 PWR_CR1.LPMS[2:0] 三位字段选择。SLEEP 模式仅停止 CPU 时钟，外设仍在运行，电流约 200μA；STOP2 模式停止所有时钟并关闭 PLL，仅 RTC 和 EXTI 可用，电流约 1.1μA（Scale 3）。唤醒延迟从 SLEEP 的 1 个周期到 STOP2 的 5μs 不等。\n\n第四层——**系统级电源管理**（System Power）。将外围电路（传感器、RF 模块、显示屏）的 VDD 通过 GPIO 控制的 MOSFET 切断，整体电流可降至 <100nA。这是硬件+软件的协同设计，软件负责在睡眠前关闭外设电源、唤醒后重新初始化。\n\n四层架构的组合策略可以用一个策略模式实现：每个电源管理策略注册 pre_enter 和 post_wakeup 回调，核心管理器只负责选择最深安全的模式。正如《人月神话》所言「没有银弹」——不存在一种低功耗方案覆盖所有场景，你必须根据唤醒频率、数据保留需求、唤醒源类型来组合这四层。\n\n| 层次 | 控制手段 | 典型电流 | 代价 | 适用场景 |\n|------|----------|---------|------|----------|\n| 时钟树 | RCC_APBxENR 位清零 | -0.5~-2mA/模块 | 无 | 所有场景，零成本 |\n| 电压域 | PWR_CR1.Scale 调节 | 5mA→1mA | ADC 精度降、Flash 延迟增 | 可降频运行的场景 |\n| 核心睡眠 | PWR_CR1.LPMS[2:0] | 200μA→1.1μA | 唤醒延迟、RAM 丢失 | 间歇性工作 |\n| 系统级 | GPIO 控制 MOSFET | <100nA | 硬件设计复杂 | 电池供电、年续航 |\n\n架构选择的关键判断标准是**唤醒频率**：如果系统每秒唤醒一次，四层全上的复杂度不值得；如果每天唤醒几次，STOP2 + 策略模式的组合是最优解。",
-      "code": "// 低功耗策略模式：可组合的电源管理接口\n\ntypedef struct {\n    const char *name;\n    uint8_t max_depth;     // 0=SLEEP, 1=STOP2, 2=STANDBY\n    void (*pre_enter)(void);\n    void (*post_wakeup)(void);\n} power_strategy_t;\n\n// 策略注册表\n#define MAX_STRATEGIES 8\nstatic power_strategy_t strategies[MAX_STRATEGIES];\nstatic uint8_t strategy_count = 0;\n\n// 注册策略（调用前确保 HAL 已初始化）\nint power_register_strategy(power_strategy_t *s) {\n    if (strategy_count >= MAX_STRATEGIES) return -1;\n    strategies[strategy_count++] = *s;\n    return 0;\n}\n\n// 核心入口：选择最深安全模式\nvoid power_manager_enter_sleep(void) {\n    // 遍历策略，找到 max_depth 最大的那个\n    uint8_t best_depth = 0;\n    for (uint8_t i = 0; i < strategy_count; i++) {\n        if (strategies[i].max_depth > best_depth) {\n            best_depth = strategies[i].max_depth;\n        }\n    }\n    // 执行 pre_enter 回调\n    for (uint8_t i = 0; i < strategy_count; i++) {\n        if (strategies[i].pre_enter != NULL) {\n            strategies[i].pre_enter();\n        }\n    }\n    // 根据 best_depth 进入对应模式\n    if (best_depth >= 2) {\n        HAL_PWR_EnterSTANDBYMode();\n    } else if (best_depth >= 1) {\n        HAL_PWR_EnterSTOP2Mode(PWR_LOWPOWERREGULATOR_ON);\n    } else {\n        HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON, PWR_SLEEPENTRY_WFI);\n    }\n    // 唤醒后执行 post_wakeup\n    for (uint8_t i = 0; i < strategy_count; i++) {\n        if (strategies[i].post_wakeup != NULL) {\n            strategies[i].post_wakeup();\n        }\n    }\n}\n\n// 示例：注册一个 STOP2 策略\nstatic void sensor_pre_enter(void) {\n    // 关闭传感器时钟，切换到待机\n    __HAL_RCC_I2C3_CLK_DISABLE();\n}\nstatic void sensor_post_wakeup(void) {\n    // 恢复 I2C，重新初始化传感器\n    __HAL_RCC_I2C3_CLK_ENABLE();\n    HAL_I2C_Init(&hi2c3);\n}\n\npower_strategy_t sensor_strategy = {\n    .name = \"sensor_stop2\",\n    .max_depth = 1,\n    .pre_enter = sensor_pre_enter,\n    .post_wakeup = sensor_post_wakeup\n};",
+      "tags": ["DMA", "环形缓冲区", "ADT", "信息隐藏", "三层架构"],
+      "explanation": "「清晰的接口比聪明的实现更重要。」——《UNIX编程艺术》第 2 章「设计与规则」。DMA 环形缓冲区的核心架构思想是将 DMA 硬件写入与 CPU 消费完全解耦：DMA 只管往缓冲区写数据，CPU 只管从缓冲区读数据，两者通过环形缓冲区的读写指针通信。《C语言接口与实现》第 3 章提出的抽象数据类型（ADT）模式在这里完美适用——将环形缓冲区的内部状态（head/tail/size/overflow）封装为私有，对外暴露 init/push/pop/count/clear 五个接口。代价是：ADT 封装引入了间接调用开销（约 150ns/次），且缓冲区大小必须是 2 的幂次方才能用位运算替代取模——这个约束意味着你可能需要浪费 10-25% 的 RAM 空间来对齐到 2 的幂。正如《人月神话》「没有银弹」所言，不存在完美的缓冲区方案，你必须根据数据速率和 CPU 处理能力在缓冲区长度和溢出策略之间做取舍。",
+      "content": "DMA 环形缓冲区的核心架构思想是**生产者-消费者分离**。DMA 硬件作为生产者，以固定速率（由波特率和 DMA 通道配置决定）将数据写入环形缓冲区；CPU 作为消费者，以不确定的速率从缓冲区中读取数据。两者的速度差异通过环形缓冲区的容量来缓冲——这就是经典的流量整形（traffic shaping）模式。\n\n《C语言接口与实现》第 3 章提出的**抽象数据类型（ADT）**模式是这一架构的关键。ADT 的核心原则是：将数据结构（head/tail/size/overflow_flag）隐藏在私有头文件中，对外暴露一组操作接口（ringbuf_init/push/pop/count/clear）。应用层不需要知道 head 是如何步进更新的，也不需要关心溢出检测的位运算逻辑。\n\n三层架构进一步分解了职责：\n\n**第一层——DMA 搬运层**：只管数据搬运。HAL 回调 HAL_UART_RxCpltCallback 中更新 head 指针，调用 __DSB() 确保内存可见性，执行溢出检测。这一层不解析任何协议，只负责把字节从 DMA 缓冲区搬运到环形缓冲区。\n\n**第二层——缓冲区管理层**：管理读写指针和溢出检测。暴露 data_available() 和 read_byte() 两个接口。环形缓冲区大小必须是 2 的幂（推荐 512 字节），这样 (ptr + 1) & mask 比 % size 快 10 倍以上。\n\n**第三层——协议解析层**：从缓冲区取数据并解析。业务逻辑在这里，可以在任务上下文中阻塞。新增协议只需要在这一层加一个 else-if，不影响底层。\n\n| 层次 | 职责 | 调用上下文 | 关键函数 |\n|------|------|-----------|----------|\n| DMA 搬运层 | head 更新、溢出检测 | ISR（HAL 回调） | __DSB(), ringbuf_push() |\n| 缓冲区管理层 | 读写指针、容量管理 | 所有上下文 | ringbuf_count(), ringbuf_pop() |\n| 协议解析层 | 字节解析、状态机 | 应用任务 | parse_protocol_byte() |\n\n架构选择的判断标准是**数据速率 vs CPU 处理能力**：如果 DMA 数据速率（如 115200 baud = 11520 byte/s）超过 CPU 每秒能处理的字节数，缓冲区必须足够大以容纳一个完整处理周期的数据量。以 512 字节缓冲区为例，在 115200 波特率下可缓冲约 44ms 的数据——这对于大多数协议解析来说足够了。",
+      "code": "/* 环形缓冲区 ADT 接口定义（伪代码） */\n\ntypedef struct {\n    volatile uint16_t head;\n    volatile uint16_t tail;\n    uint16_t size;\n    uint16_t mask;\n    uint8_t overflow;\n    uint8_t data[];\n} ring_buffer_t;\n\n/* 公开接口 */\nring_buffer_t *ringbuf_create(uint16_t buf_size);\nvoid ringbuf_destroy(ring_buffer_t *rb);\nint ringbuf_push(ring_buffer_t *rb, uint8_t byte);\nint ringbuf_pop(ring_buffer_t *rb, uint8_t *out);\nuint16_t ringbuf_count(ring_buffer_t *rb);\nvoid ringbuf_clear(ring_buffer_t *rb);",
       "pitfalls": [],
       "refBook": [
-        "《UNIX编程艺术》ch6「组合性」",
+        "《UNIX编程艺术》ch2「设计与规则」",
         "《C语言接口与实现》ch3「抽象数据类型」",
         "《人月神话》「没有银弹」"
       ]
     },
     {
-      "id": "2026-05-05-lp-snippet",
-      "title": "STOP2 模式的最小化进入/退出流程",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-snippet",
+      "title": "DMA 环形缓冲区：ISR 端 head 更新（快照模式）",
+      "topic": "DMA环形缓冲区",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["STOP2", "电源管理", "时钟恢复", "HAL"],
-      "explanation": "「在嵌入式系统中，进入睡眠很容易，从睡眠中醒来才是考验。」——《嵌入式系统设计与实践》。STOP2 模式的唤醒流程比 SLEEP 复杂得多：PLL 需要重新锁定（5μs）、Flash 需要重新配置等待周期、外设时钟需要逐个恢复。这段代码展示了完整的进入/退出流程，重点标注了唤醒后时钟恢复的顺序。",
-      "content": "以下是 STM32L4 进入 STOP2 模式的最小化流程实现。关键步骤：① 进睡眠前关闭所有不必要的外设时钟和 SRAM 电源；② 将未用 GPIO 设为模拟输入（MODER=00），避免上拉/下拉漏电；③ 清除唤醒标志（__HAL_PWR_CLEAR_WUF_FLAG）；④ 调用 HAL_PWR_EnterSTOP2Mode()；⑤ 唤醒后首先恢复 HSI16 时钟（STOP 模式下自动切换），然后重新配置 PLL（如果需要高频运行）；⑥ 逐个恢复外设时钟。唤醒后的总恢复时间约 100-200μs（取决于外设数量）。电流测量应在 Release 模式、无调试器条件下进行，否则 SWD 调试接口本身就会消耗 2-5mA。",
-      "code": "/* stop2_power.c - STOP2 模式最小化进入/退出流程 */\n#include \"stm32l4xx_hal.h\"\n\n/* 进睡眠前：关闭不必要的外设时钟 */\nstatic void pre_stop2_enter(void) {\n    /* 第 1 步：关闭所有未使用的外设时钟 */\n    __HAL_RCC_SPI2_CLK_DISABLE();\n    __HAL_RCC_I2C3_CLK_DISABLE();\n    __HAL_RCC_DAC1_CLK_DISABLE();\n    __HAL_RCC_ADC1_CLK_DISABLE();\n\n    /* 第 2 步：关闭 SRAM2/备份域电源 */\n    HAL_PWREx_DisableSRAM2();\n    HAL_PWREx_DisableBackupRegulator();\n\n    /* 第 3 步：将未用 GPIO 设为模拟输入（防漏电）*/\n    GPIO_TypeDef *unused_ports[] = {GPIOB, GPIOC, GPIOD};\n    for (int i = 0; i < 3; i++) {\n        unused_ports[i]->MODER = 0x00000000;\n    }\n\n    /* 第 4 步：清除唤醒标志（必须在进睡眠前调用）*/\n    __HAL_PWR_CLEAR_WUF_FLAG();\n}\n\n/* 唤醒后：恢复时钟和外设 */\nstatic void post_stop2_wakeup(void) {\n    /* 第 1 步：唤醒后 HSI16 已自动恢复 */\n    /* 如果需要高频运行，重新配置 PLL */\n    SystemClock_Config();\n\n    /* 第 2 步：恢复外设时钟 */\n    __HAL_RCC_SPI2_CLK_ENABLE();\n    __HAL_RCC_I2C3_CLK_ENABLE();\n    __HAL_RCC_ADC1_CLK_ENABLE();\n\n    /* 第 3 步：恢复 SRAM 电源 */\n    HAL_PWREx_EnableSRAM2();\n\n    /* 第 4 步：清除唤醒标志（唤醒后也要清一次）*/\n    __HAL_PWR_CLEAR_WUF_FLAG();\n}\n\n/* 主循环中的调用 */\nvoid main_loop(void) {\n    while (1) {\n        /* 处理工作 */\n        process_tasks();\n\n        /* 准备进入 STOP2 */\n        pre_stop2_enter();\n\n        /* 进入 STOP2 - 此时 CPU 停止，仅 RTC/EXTI 运行 */\n        HAL_PWR_EnterSTOP2Mode(PWR_LOWPOWERREGULATOR_ON);\n\n        /* 唤醒后自动执行 */\n        post_stop2_wakeup();\n    }\n}\n\n/* 中断服务函数：唤醒源处理 */\nvoid RTC_Alarm_IRQHandler(void) {\n    /* RTC 闹钟唤醒 STOP2 的标准处理 */\n    __HAL_RTC_ALARM_CLEAR_FLAG(&hrtc, RTC_FLAG_ALRAF);\n    /* 设置标志让主循环知道被闹钟唤醒 */\n    set_wakeup_source(WAKEUP_RTC_ALARM);\n}",
+      "tags": ["DMA", "环形缓冲区", "ISR", "volatile", "快照模式"],
+      "explanation": "这段代码展示 DMA 传输完成回调中更新环形缓冲区 head 指针的标准做法。关键点：① 缓冲区大小必须是 2 的幂（RING_SIZE=512），用 mask 做位运算替代取模；② head/tail 声明为 volatile，因为 ISR 写、任务读；③ 更新 head 前先调用 __DSB() 确保 DMA 写入的内存内容对所有核心可见（Cortex-M7 尤其重要）；④ 溢出检测：如果 transferred - prev_head 超过缓冲区一半（RING_SIZE/2=256），说明 CPU 读得太慢，数据被覆盖。「嵌入式编程的难点不在于写出能跑的代码，而在于写出在边界条件下仍然正确的代码。」——《C陷阱与缺陷》第 5 章「未定义行为」。",
+      "content": "这段代码展示 DMA 传输完成回调中更新环形缓冲区 head 指针的标准做法。关键点：① 缓冲区大小必须是 2 的幂（RING_SIZE=512），用 mask 做位运算替代取模；② head/tail 声明为 volatile，因为 ISR 写、任务读；③ 更新 head 前先调用 __DSB() 确保 DMA 写入的内存内容对所有核心可见（Cortex-M7 尤其重要）；④ 溢出检测：如果 transferred - prev_head 超过缓冲区一半（RING_SIZE/2=256），说明 CPU 读得太慢，数据被覆盖。中断优先级设置：DMA 中断优先级设为 3（NVIC 数字越大优先级越低），确保 CPU 有足够时间处理缓冲区数据。HAL 回调中禁止调用阻塞函数（如 HAL_Delay），否则会饿死更高优先级中断。",
+      "code": "/* dma_ringbuf_isr.c - DMA 传输完成回调中的 head 更新 */\n#include <stm32l4xx_hal.h>\n\n/* 缓冲区参数 */\n#define RING_SIZE 512\n#define RING_MASK (RING_SIZE - 1)\n\n/* 环形缓冲区——ISR 写 head，任务读 head 写 tail */\nstatic volatile uint16_t rx_head = 0;\nstatic volatile uint16_t rx_tail = 0;\nstatic volatile uint8_t overflow_flag = 0;\nstatic uint8_t rx_buffer[RING_SIZE]\n    __attribute__((aligned(8)));\nstatic uint16_t prev_head = 0;\n\n/* DMA 传输完成回调——由 HAL 库自动调用 */\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    /* 第 1 步：__DSB 确保 DMA 写入的内存可见 */\n    __DSB();\n\n    /* 第 2 步：更新 head 指针（步进式，不读 CNDTR）*/\n    uint16_t new_head = (rx_head + 1) & RING_MASK;\n\n    /* 第 3 步：溢出检测——transferred 回绕超一半 */\n    if ((new_head - prev_head) & RING_MASK > RING_SIZE / 2) {\n        overflow_flag = 1;\n    }\n    prev_head = new_head;\n\n    /* 第 4 步：提交新 DMA 传输（Circular 模式可省）*/\n    /* HAL_UART_Receive_DMA(huart, rx_buffer, RING_SIZE); */\n\n    /* 第 5 步：更新 head——必须在最后，确保前面写入可见 */\n    __DSB();\n    rx_head = new_head;\n}",
       "pitfalls": [],
       "refBook": [
-        "《代码大全》ch25「防御性编程」",
-        "《C陷阱与缺陷》sec3「volatile 的正确用法」"
+        "《C语言接口与实现》ch3「抽象数据类型」",
+        "《代码大全》ch5「防御性编程」"
       ]
     },
     {
-      "id": "2026-05-05-lp-tip",
-      "title": "低功耗设计的 5 个致命陷阱",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-tip",
+      "title": "DMA 环形缓冲区的 5 个致命陷阱",
+      "topic": "DMA环形缓冲区",
       "mode": "tip",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "note",
       "difficulty": "advanced",
-      "tags": ["低功耗", "陷阱", "漏电", "唤醒", "调试"],
-      "explanation": "「计划再计划——你永远低估了复杂性。」——《人月神话》第 10 章。低功耗设计尤其如此：你以为关了外设时钟就万事大吉，结果发现 GPIO 上拉电阻在偷电流；你以为进了 STOP2 就省电了，结果调试器还连着，SWD 接口消耗了 5mA。以下 5 个陷阱每个都曾是生产环境中的真实问题。",
-      "content": "陷阱 1：**反复唤醒死循环导致电流虚高**。触发条件：进入睡眠前未清除 PWR_SR1.SBF（SleepWoken Flag）或 __HAL_PWR_CLEAR_WUF_FLAG() 调用时机不对。症状：预期电流 1μA，实测 500μA，用示波器测 VDD 发现电流呈周期性尖峰（每 50ms 一次）。修复：在 pre_enter 回调的最后调用 __HAL_PWR_CLEAR_WUF_FLAG()，并在唤醒后的 post_wakeup 开头再调用一次。注意：ST 官方 HAL 文档中这个函数的调用时机描述不一致，以 RM0398 Reference Manual 为准。\n\n陷阱 2：**GPIO 上拉/下拉在睡眠模式下持续漏电**。触发条件：系统有多个 GPIO 未配置，其中部分配置为上拉（PUPDR 非零）。症状：静置电流多出 33-100μA，且不同批次芯片漏电值差异大（取决于内部上拉电阻公差）。修复：进睡眠前将所有未用 GPIO 的 MODER 设为 0（模拟输入模式），PUPDR 清零。唯一例外是 WKUP 引脚——它必须配置为上拉才能作为唤醒源。这个陷阱在 PCB 设计不良时更严重：如果 WKUP 引脚外部接了 10kΩ 下拉电阻到 GND，睡眠电流会额外增加 330μA（3.3V/10k）。\n\n陷阱 3：**ADC/DAC 电源域未完全关闭**。触发条件：进入 STOP 模式前调用了 __HAL_RCC_ADC_CLK_DISABLE()，但未确认 ADC1->CR 的 ADEN 位已清零。症状：STOP2 模式下电流 200μA（手册标称 1.1μA），差了近 200 倍。修复：时钟禁用后读回 ADC1->CR 确认 ADEN=0，如果未清零则循环等待或手动清零。同理，DAC 的 DAC1->CR.DACEN 也需要确认。\n\n陷阱 4：**调试器阻止深度睡眠**。触发条件：在 IDE 中通过 SWD/JTAG 调试时测量电流。症状：IDE 中测到 50μA，拔掉调试器后实测 5mA。根因：SWD 接口保持 DBGMCU 模块激活，阻止 CPU 进入深度睡眠。修复：永远在 Release 模式 + 无调试器条件下测量最终功耗。如果需要在调试时保留低功耗能力，设置 DBGMCU->CR.SLEEP_DBG=1 允许调试时仍进入睡眠模式，但这会增加约 100μA 的静态功耗。\n\n陷阱 5：**时钟恢复顺序错误导致 HardFault**。触发条件：唤醒后先使能外设时钟，再调用 SystemClock_Config() 恢复 PLL。症状：外设通信失败（SPI/I2C 无响应），或触发 HardFault（如果外设访问了未就绪的时钟域）。修复：严格按以下顺序：① 确认 HSI16 已就绪（STOP 模式退出后硬件自动切换）；② 调用 SystemClock_Config() 恢复 PLL 和系统时钟；③ 使能外设时钟。这个顺序不能颠倒，因为外设寄存器访问依赖于正确的系统时钟频率。",
-      "code": "/* 陷阱 2 的修复：批量关闭未用 GPIO 的上拉/下拉 */\nvoid disable_unused_gpio_leakage(void) {\n    /* 保存 WKUP 引脚配置 */\n    uint32_t wkup_pin = WKUP_PIN_NUMBER;  /* 例如 PA0 = 0 */\n    GPIO_TypeDef *wkup_port = WKUP_PORT;   /* 例如 GPIOA */\n\n    /* 遍历所有 GPIO 端口 */\n    GPIO_TypeDef *ports[] = {GPIOA, GPIOB, GPIOC, GPIOD,\n                             GPIOE, GPIOF, GPIOG};\n    int num_ports = 7;\n\n    for (int i = 0; i < num_ports; i++) {\n        /* 跳过 WKUP 引脚所在端口 */\n        if (ports[i] == wkup_port) continue;\n\n        /* 设为模拟输入（MODER=00），清除上拉/下拉 */\n        ports[i]->MODER = 0x00000000;\n        ports[i]->PUPDR = 0x00000000;\n    }\n\n    /* WKUP 引脚保持上拉配置 */\n    wkup_port->PUPDR |= (0x01 << (wkup_pin * 2));\n}\n\n/* 陷阱 3 的修复：确认 ADC 电源完全关闭 */\nvoid confirm_adc_power_off(ADC_HandleTypeDef *hadc) {\n    /* 禁用时钟 */\n    __HAL_RCC_ADC_CLK_DISABLE();\n\n    /* 等待 ADEN 位清零（最多 100 次轮询）*/\n    for (int i = 0; i < 100; i++) {\n        if ((hadc->Instance->CR & ADC_CR_ADEN) == 0) {\n            return; /* 确认关闭 */\n        }\n        HAL_Delay(1); /* 1ms 间隔 */\n    }\n    /* 超时仍未关闭，手动清零 */\n    hadc->Instance->CR &= ~ADC_CR_ADEN;\n}",
+      "tags": ["DMA", "环形缓冲区", "陷阱", "竞态", "Cache一致性"],
+      "explanation": "「乐观估计是嵌入式开发中最常见的错误来源。」——《人月神话》第 9 章「计划再计划」。DMA 环形缓冲区看似简单——两个指针加一块 RAM——但实际工程中至少有 5 个经典陷阱，每个都能让一个看似正常的系统在某个波特率下突然崩溃。以下陷阱按严重程度排序，前三个几乎在所有 DMA 项目中都会遇到。",
+      "content": "陷阱 1：**缓冲区大小非 2 的幂导致位运算掩码错误**。触发条件：定义 uint8_t buf[300] 后直接用 (ptr+1)&299 做环形寻址。症状：写入第 300 字节后 head 指针跳到错误位置，读取出乱码或 HardFault。修复：init 时断言 assert((sz & (sz-1)) == 0)，然后用 buf[512] 覆盖 buf[300]，浪费 212 字节换取正确性。\n\n陷阱 2：**volatile 缺失导致 -O2 优化后 CPU 读到过期 head 值**。触发条件：head/tail 声明为 uint16_t 而非 volatile uint16_t。症状：前几秒正常，优化编译后突然停止接收。修复：声明为 volatile uint16_t，且在更新 head 前后各调用一次 __DSB() 内存屏障。\n\n陷阱 3：**Cortex-M7 上 DMA 缓冲区未对齐导致 Cache 一致性崩溃**。触发条件：M7 核有 Data Cache，缓冲区地址未按 Cache Line（8 字节）对齐。症状：DMA 写入的数据在核心侧读取时出现随机字节错位，仅 M7 核出现，M4/M3 正常。修复：声明时用 __attribute__((aligned(8))) 对齐，更新 head 前调用 SCB_CleanDCache_by_Addr(buf, SIZE, 8)。\n\n陷阱 4：**DMA Circular 模式下 CNDTR 重载的时序窗口**。触发条件：ISR 中读 DMA2->ISR.CNDTR 计算 transferred，恰好读到 CNDTR 从 1 重载为 SIZE 的瞬间。症状：ISR 计算出 transferred=0，head 回退，导致数据被重复处理或漏处理。修复：不在 ISR 中读 CNDTR，改用步进更新 transferred = (transferred + 1) & RING_MASK。\n\n陷阱 5：**应用层 while(avail > 0) 循环中 head 被 ISR 更新导致死锁**。触发条件：应用任务读 avail 后进入 for 循环，ISR 在此期间更新了 head 导致 avail 持续增长。症状：while 循环条件永远为真，任务死锁，CPU 占用率 100%。修复：用快照模式——先读 head/tail 到局部变量，循环中使用快照值。",
+      "code": "/* 陷阱 5 修复：快照模式——避免 while(avail) 死锁 */\nvoid process_ring_buffer(void) {\n    /* 第 1 步：读 head/tail 到局部变量（快照）*/\n    uint16_t head_snap = rx_head;\n    uint16_t tail_snap = rx_tail;\n\n    /* 第 2 步：用快照值计算可用字节数 */\n    uint16_t avail;\n    if (head_snap >= tail_snap) {\n        avail = head_snap - tail_snap;\n    } else {\n        avail = RING_SIZE - tail_snap + head_snap;\n    }\n\n    /* 第 3 步：用快照值循环读取——ISR 不会干扰 */\n    for (uint16_t i = 0; i < avail; i++) {\n        uint8_t byte = rx_buffer[tail_snap];\n        tail_snap = (tail_snap + 1) & RING_MASK;\n        process_byte(byte);\n    }\n\n    /* 第 4 步：更新 tail（仅在循环结束后）*/\n    __DSB();\n    rx_tail = tail_snap;\n}",
       "pitfalls": [
-        "陷阱 1：触发条件 - 进睡眠前未调用 __HAL_PWR_CLEAR_WUF_FLAG() 或调用时机错误 → 症状 - 预期电流 1μA 实测 500μA，示波器看到周期性电流尖峰（每 50ms 一次） → 修复 - 在 pre_enter 最后和 post_wakeup 开头各调用一次 __HAL_PWR_CLEAR_WUF_FLAG()，以 RM0398 Reference Manual 为准",
-        "陷阱 2：触发条件 - 未用 GPIO 的 PUPDR 未清零，配置为上拉/下拉 → 症状 - 静置电流多出 33-100μA，不同批次芯片漏电差异大 → 修复 - 进睡眠前将未用 GPIO MODER=0（模拟输入），PUPDR=0，WKUP 引脚除外（必须上拉）；注意 PCB 外部下拉电阻也会叠加漏电",
-        "陷阱 3：触发条件 - 只调用了 __HAL_RCC_ADC_CLK_DISABLE() 但未确认 ADC1->CR.ADEN=0 → 症状 - STOP2 电流 200μA（手册标称 1.1μA） → 修复 - 时钟禁用后读回 ADC1->CR 确认 ADEN 清零，循环等待或手动清零；DAC 同理",
-        "陷阱 4：触发条件 - 通过 SWD/JTAG 调试时测量电流 → 症状 - IDE 中测 50μA，拔调试器后 5mA → 修复 - 永远在 Release + 无调试器条件下测量；调试时保留低功耗能力可设 DBGMCU->CR.SLEEP_DBG=1（增加约 100μA）",
-        "陷阱 5：触发条件 - 唤醒后先使能外设时钟再调 SystemClock_Config() → 症状 - SPI/I2C 通信失败或 HardFault → 修复 - 严格按顺序：①确认 HSI16 就绪 ②SystemClock_Config() 恢复 PLL ③使能外设时钟"
+        "陷阱 1：缓冲区大小非 2 的幂导致位运算掩码错误。触发条件：定义 uint8_t buf[300] 后直接用 (ptr+1)&299 做环形寻址。症状：写入第 300 字节后 head 指针跳到错误位置，读取出乱码或 HardFault。修复：init 时断言 assert((sz & (sz-1)) == 0)，然后用 buf[512] 覆盖 buf[300]，浪费 212 字节换取正确性。",
+        "陷阱 2：volatile 缺失导致 -O2 优化后 CPU 读到过期 head 值。触发条件：head/tail 声明为 uint16_t 而非 volatile uint16_t。症状：前几秒正常，优化编译后突然停止接收。修复：声明为 volatile uint16_t，且在更新 head 前后各调用一次 __DSB() 内存屏障。",
+        "陷阱 3：Cortex-M7 上 DMA 缓冲区未对齐导致 Cache 一致性崩溃。触发条件：M7 核有 Data Cache，缓冲区地址未按 Cache Line（8 字节）对齐。症状：DMA 写入的数据在核心侧读取时出现随机字节错位，仅 M7 核出现，M4/M3 正常。修复：声明时用 __attribute__((aligned(8))) 对齐，更新 head 前调用 SCB_CleanDCache_by_Addr(buf, SIZE, 8)。",
+        "陷阱 4：DMA Circular 模式下 CNDTR 重载的时序窗口。触发条件：ISR 中读 DMA2->ISR.CNDTR 计算 transferred，恰好读到 CNDTR 从 1 重载为 SIZE 的瞬间。症状：ISR 计算出 transferred=0，head 回退，导致数据被重复处理或漏处理。修复：不在 ISR 中读 CNDTR，改用步进更新 transferred = (transferred + 1) & RING_MASK。",
+        "陷阱 5：应用层 while(avail > 0) 循环中 head 被 ISR 更新导致死锁。触发条件：应用任务读 avail 后进入 for 循环，ISR 在此期间更新了 head 导致 avail 持续增长。症状：while 循环条件永远为真，任务死锁，CPU 占用率 100%。修复：用快照模式——先读 head/tail 到局部变量，循环中使用快照值。"
       ],
       "refBook": [
-        "《人月神话》ch10「计划再计划」",
-        "《C陷阱与缺陷》sec3「预处理与硬件交互」",
-        "《代码大全》ch25「防御性编程」"
+        "《人月神话》ch9「计划再计划」",
+        "《C陷阱与缺陷》ch5「未定义行为」",
+        "《代码大全》ch5「防御性编程」"
       ]
     },
     {
-      "id": "2026-05-05-lp-refactor",
-      "title": "从裸函数到策略模式：电源管理的重构",
-      "topic": "低功耗设计",
+      "id": "2026-05-05-dma-refactor",
+      "title": "从裸指针算术到 ADT：环形缓冲区重构",
+      "topic": "DMA环形缓冲区",
       "mode": "refactor",
       "language": "C",
-      "platform": "STM32HAL",
+      "platform": "通用嵌入式",
       "toolchain": "HAL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["重构", "策略模式", "电源管理", "代码坏味道"],
-      "explanation": "「如果你发现自己需要为类似的情况写类似的代码，那就是抽象的信号。」——《重构》第 2 版第 34 页。这段重构展示了如何将分散的电源管理裸函数改造为策略模式，核心改动是将 pre_enter/post_wakeup 逻辑从硬编码的 if-else 中提取为可注册的回调，使得新增一种电源策略不需要修改核心管理器代码。代价是增加了策略注册表的内存开销（每个策略约 32 字节）和间接调用开销（约 200ns）。",
-      "content": "重构前：电源管理逻辑散落在多个 if-else 分支中，每个分支硬编码了特定的 pre/post 操作。新增一种睡眠模式需要修改核心函数，违反开闭原则。重构后：采用策略模式，每种电源管理策略独立注册 pre_enter 和 post_wakeup 回调，核心管理器只做两件事——选择最深安全模式、依次执行回调。关键改进点：① 新增策略无需修改核心代码（开闭原则）；② 每个策略的 pre/post 逻辑内聚在同一结构体中；③ 策略的 max_depth 字段让管理器自动选择最优模式。代价：策略注册表占用约 256 字节（8 个策略 × 32 字节），回调间接调用增加约 200ns 延迟（在 STOP2 唤醒场景中可忽略）。",
-      "code": "/* ===== 重构前：if-else 硬编码（坏味道：重复、紧耦合）=====\n * 问题：\n * 1. 新增一种电源模式需要修改 power_enter_deep_sleep()\n * 2. pre/post 逻辑分散在不同函数中\n * 3. 无法组合多个电源策略\n */\nvoid power_enter_deep_sleep(int mode) {\n    if (mode == 0) {\n        /* SLEEP 模式 */\n        __HAL_RCC_SPI2_CLK_DISABLE();\n        HAL_PWR_EnterSLEEPMode(...);\n        __HAL_RCC_SPI2_CLK_ENABLE();\n    } else if (mode == 1) {\n        /* STOP2 模式 */\n        __HAL_RCC_SPI2_CLK_DISABLE();\n        __HAL_RCC_I2C3_CLK_DISABLE();\n        HAL_PWREx_DisableSRAM2();\n        HAL_PWR_EnterSTOP2Mode(...);\n        SystemClock_Config();\n        __HAL_RCC_SPI2_CLK_ENABLE();\n        __HAL_RCC_I2C3_CLK_ENABLE();\n        HAL_PWREx_EnableSRAM2();\n    } else if (mode == 2) {\n        /* STANDBY 模式 */\n        __HAL_RCC_SPI2_CLK_DISABLE();\n        __HAL_RCC_I2C3_CLK_DISABLE();\n        __HAL_RCC_USB_CLK_DISABLE();\n        HAL_PWR_EnterSTANDBYMode();\n        /* STANDBY 唤醒后相当于复位，无需恢复 */\n    }\n}\n\n/* ===== 重构后：策略模式（改进：开闭原则、可组合）=====\n * 改进：\n * 1. 新增策略只需注册，不修改核心代码\n * 2. 每个策略的 pre/post 逻辑内聚\n * 3. 管理器自动选择最深安全模式\n */\ntypedef struct {\n    const char *name;\n    uint8_t max_depth;  // 0=SLEEP, 1=STOP2, 2=STANDBY\n    void (*pre_enter)(void);\n    void (*post_wakeup)(void);\n} power_strategy_t;\n\n#define MAX_STRATEGIES 8\nstatic power_strategy_t g_strategies[MAX_STRATEGIES];\nstatic uint8_t g_count = 0;\n\nint register_power_strategy(power_strategy_t *s) {\n    if (g_count >= MAX_STRATEGIES) return -1;\n    g_strategies[g_count++] = *s;\n    return 0;\n}\n\nvoid enter_deep_sleep(void) {\n    /* 找最深模式 */\n    uint8_t depth = 0;\n    for (uint8_t i = 0; i < g_count; i++) {\n        if (g_strategies[i].max_depth > depth)\n            depth = g_strategies[i].max_depth;\n    }\n    /* 执行所有 pre_enter */\n    for (uint8_t i = 0; i < g_count; i++)\n        if (g_strategies[i].pre_enter)\n            g_strategies[i].pre_enter();\n    /* 进入对应模式 */\n    if (depth >= 2)\n        HAL_PWR_EnterSTANDBYMode();\n    else if (depth >= 1)\n        HAL_PWR_EnterSTOP2Mode(PWR_LOWPOWERREGULATOR_ON);\n    else\n        HAL_PWR_EnterSLEEPMode(PWR_MAINREGULATOR_ON,\n                               PWR_SLEEPENTRY_WFI);\n    /* 执行所有 post_wakeup */\n    for (uint8_t i = 0; i < g_count; i++)\n        if (g_strategies[i].post_wakeup)\n            g_strategies[i].post_wakeup();\n}\n\n/* 使用示例：注册一个 STOP2 策略 */\nstatic void spi_pre_enter(void) {\n    __HAL_RCC_SPI2_CLK_DISABLE();\n}\nstatic void spi_post_wakeup(void) {\n    __HAL_RCC_SPI2_CLK_ENABLE();\n}\npower_strategy_t spi_strategy = {\n    .name = \"spi_stop2\",\n    .max_depth = 1,\n    .pre_enter = spi_pre_enter,\n    .post_wakeup = spi_post_wakeup\n};\n\n/* 注册后，enter_deep_sleep() 自动管理 SPI 时钟 */\nregister_power_strategy(&spi_strategy);",
-      "pitfalls": [],
+      "tags": ["DMA", "环形缓冲区", "重构", "ADT", "代码坏味道"],
+      "explanation": "「任何足够复杂的裸指针算术，最终都会写出 bug。」——《重构》第 2 版第 3 章「代码坏味道」。这段重构展示了如何将散落在 ISR 和任务中的裸指针算术提取为环形缓冲区 ADT，核心改动是将 head/tail 的步进逻辑封装为 ringbuf_push/ringbuf_pop 接口，溢出检测封装为 ringbuf_is_full。代价是：每个 push/pop 调用增加约 150ns 间接开销，且 ADT 结构体本身占用 20 字节元数据。",
+      "content": "重构前的代码有两个明显的坏味道：**重复逻辑**（ISR 和任务中各自实现了环形寻址的 (ptr+1)&mask 计算）和**信息泄露**（ISR 直接操作 rx_head/rx_tail 裸变量，任务也能直接读写）。这违反了《C语言接口与实现》的信息隐藏原则。\n\n重构后采用 ADT 模式：ringbuf_push/ringbuf_pop 接口封装了所有指针算术和溢出检测。ISR 中只需一行 ringbuf_push(&rb, byte)，任务中只需 while(ringbuf_pop(&rb, &byte))。新增协议解析不需要修改缓冲区管理代码。\n\n**代价分析**：① 间接调用开销——每个 push/pop 增加约 150ns（函数调用 + 边界检查），对于 115200 波特率（每字节 87μs）可忽略；② 内存开销——ADT 结构体占用 20 字节元数据（5 个 uint16_t + 1 个 uint8_t + padding），对于 512 字节缓冲区占比约 4%；③ 复杂度增加——新增开发者需要理解 ADT 接口而非裸指针算术，但这对团队长期可维护性是正向投资。\n\n《UNIX编程艺术》第 10 章「管道和过滤器」模式与这里的三层架构异曲同工：每层只做一件事，通过标准接口通信，新增功能只需在某一层插入新的过滤器。",
+      "code": "/* ===== 重构前：裸指针算术（坏味道：重复逻辑、信息泄露）===== */\n\n/* ISR 中——裸指针算术 */\nvoid DMA_USART2_RX_Callback(void) {\n    __DSB();\n    static uint16_t prev_h = 0;\n    uint16_t new_h = (rx_head + 1) & RING_MASK;\n    if ((new_h - prev_h) & RING_MASK > RING_SIZE / 2) {\n        overflow_count++;\n    }\n    prev_h = new_h;\n    __DSB();\n    rx_head = new_h;\n}\n\n/* 任务中——同样的裸指针算术重复一遍 */\nvoid Task_ProcessRX(void) {\n    uint16_t avail;\n    if (rx_head >= rx_tail) {\n        avail = rx_head - rx_tail;\n    } else {\n        avail = RING_SIZE - rx_tail + rx_head;\n    }\n    for (uint16_t i = 0; i < avail; i++) {\n        uint8_t b = rx_buffer[rx_tail];\n        rx_tail = (rx_tail + 1) & RING_MASK;\n        parse_byte(b);\n    }\n}\n\n/* ===== 重构后：ADT 封装（改进：信息隐藏、可复用）===== */\n\ntypedef struct {\n    volatile uint16_t head;\n    volatile uint16_t tail;\n    uint16_t size;\n    uint16_t mask;\n    uint8_t overflow;\n    uint8_t data[];\n} ringbuf_t;\n\n/* ISR 中——只需一行 */\nvoid DMA_USART2_RX_Callback(void) {\n    __DSB();\n    ringbuf_push(&usart2_rx_rb, dummy_byte);\n}\n\n/* 任务中——只需一行 */\nvoid Task_ProcessRX(void) {\n    uint8_t byte;\n    while (ringbuf_pop(&usart2_rx_rb, &byte)) {\n        parse_byte(byte);\n    }\n    if (usart2_rx_rb.overflow) {\n        usart2_rx_rb.overflow = 0;\n        log_overflow();\n    }\n}",
+      "pitfalls": [
+        "陷阱 1：重构后忘记将 head/tail 声明为 volatile。触发条件：将裸变量改为结构体成员后，忽略了 ISR 写/任务读的跨上下文访问。症状：-O2 优化后 ringbuf_pop 读到过期 head 值，数据丢失。修复：结构体成员 head/tail 必须声明为 volatile。",
+        "陷阱 2：ringbuf_create 分配的缓冲区未对齐。触发条件：malloc 返回的内存地址不是 8 的倍数，Cortex-M7 上触发 Cache 一致性错误。症状：仅 M7 核出现数据错位，M4 正常。修复：malloc 后用 __builtin_align_alloc 或手动对齐，或改用静态分配 + aligned 属性。",
+        "陷阱 3：push/pop 接口中溢出检测与数据写入的顺序错误。触发条件：先写数据再设 overflow 标志。症状：应用层读到数据但 overflow 标志被 ISR 覆盖。修复：先更新 overflow 标志，再写数据——或者反过来，但必须用 __DSB() 确保顺序。"
+      ],
       "refBook": [
-        "《重构》ch1「识别代码坏味道」",
-        "《UNIX编程艺术》ch5「模块原则」",
-        "《C语言接口与实现》ch4「抽象数据类型」"
+        "《重构》ch3「代码坏味道」",
+        "《UNIX编程艺术》ch10「管道和过滤器」",
+        "《C语言接口与实现》ch3「抽象数据类型」"
       ]
     }
   ]
