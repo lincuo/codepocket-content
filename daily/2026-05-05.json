@@ -1,105 +1,97 @@
 {
   "date": "2026-05-05",
-  "topic": "DMA + 循环缓冲区的正确姿势",
+  "topic": "低功耗设计的几个层次",
   "items": [
     {
-      "id": "2026-05-05-dma-arch",
-      "title": "DMA 环形缓冲区：生产者-消费者模型的嵌入式实现",
-      "topic": "DMA环形缓冲区",
+      "id": "2026-05-05-lowpower-arch",
+      "title": "四层功耗架构：从硅片到系统的降维打击",
+      "topic": "低功耗设计",
       "mode": "architecture",
       "language": "C",
-      "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
       "snippetType": "pattern",
-      "difficulty": "intermediate",
-      "tags": ["DMA", "环形缓冲区", "生产者-消费者", "ADT", "volatile"],
-      "explanation": "《UNIX编程艺术》第 10 章「管道与过滤器」提出了一个朴素却深刻的思想：系统应该由单向流动的数据管道组成，每个环节只关心自己的输入和输出，不关心上下游的实现细节。DMA 环形缓冲区就是这个思想的硬件级体现——DMA 是生产者，CPU 任务是消费者，缓冲区是管道。《C语言接口与实现》第 3 章的 ADT 模式提供了实现手段：用 ringbuf_init/push/pop/count 封装内部指针算术，暴露稳定的接口。这个架构的优点是解耦彻底——更换 DMA 通道或串口协议只需改驱动层，消费者任务完全不受影响。代价也很明确：缓冲区大小需要预估最大数据速率和处理延迟（《人月神话》的「计划再计划」在此应验——你几乎必然低估初始缓冲区大小），且 volatile 指针管理引入了微妙的竞态风险。正如《UNIX编程艺术》所言：「构建软件的最好方式是找到已知的工作方式并将其模块化。」——第 2 章「设计原则」。",
-      "content": "DMA 环形缓冲区的架构分为三层，每层有明确的职责边界和数据流方向。\n\n**第一层——DMA 搬运层（中断上下文）**：这是生产者。STM32 的 DMA2 Channel 4 配置为 UART3_RX 的外设到内存传输模式，Circular 模式使能。每次传输完成（TC 中断）或半传输（HT 中断），HAL 回调函数 `HAL_UART_RxCpltCallback` 被调用。在这个回调中，DMA 硬件已经在后台把数据写入了环形缓冲区——ISR 的唯一工作是更新 `rx_head` 指针并调用 `__DSB()` 确保写入对所有核心可见。关键细节：DMA 的 CNDTR 寄存器在 Circular 模式下会自动重载，不需要手动重启 `HAL_UART_Receive_DMA`。\n\n**第二层——缓冲区管理层（应用上下文）**：这是管道本身。环形缓冲区是一个固定大小的 `uint8_t` 数组，大小必须是 2 的幂次方（推荐 512 字节 = 2^9）。`rx_head` 由 DMA 中断更新（写），`rx_tail` 由应用任务更新（读）。两者都是 `volatile uint16_t`，因为它们在两个不同的执行上下文中被访问。缓冲区管理层的接口包括：`ringbuf_data_available()` 计算可读字节数，`ringbuf_read(buf, len)` 读取指定长度数据并推进 tail，`ringbuf_is_overflow()` 检测是否发生写满覆盖。\n\n**第三层——协议解析层（任务上下文）**：这是消费者。从环形缓冲区取出原始字节，按照 UART 协议（起始位、数据位、停止位、校验位）或应用层协议（Modbus RTU、自定义帧格式）进行解析。这一层可以在 FreeRTOS 任务中运行，使用信号量或事件组通知解析完成。\n\n三层之间的数据流是单向的：DMA → 缓冲区 → 任务。反向只有控制流：任务通过 `ringbuf_reset()` 清空缓冲区（极少使用）。\n\n**容量设计公式**：最小缓冲区大小 = 最大帧间隔时间 × 波特率 / 8。例如 115200 波特率、CPU 处理一帧耗时 5ms，则最小需要 (115200/8) × 0.005 = 72 字节 → 取 128 字节（2^7）。推荐留 4 倍余量 → 512 字节（2^9）。\n\n| 层级 | 执行上下文 | 职责 | 关键接口 |\n|------|-----------|------|----------|\n| DMA 搬运层 | IRQHandler | 数据搬运 + head 更新 | HAL_UART_RxCpltCallback |\n| 缓冲区管理层 | 应用层 | 读写指针管理 + 溢出检测 | ringbuf_data_available/read/reset |\n| 协议解析层 | Task | 帧解析 + 业务逻辑 | parse_modbus_frame / parse_custom_proto |\n\n这个架构的可扩展性体现在：新增一种协议只需在第三层加一个解析器，不需要触碰底层 DMA 配置。新增一种 DMA 源（如 SPI 接收）只需复制一层 DMA 搬运 + 一个缓冲区实例，消费者接口不变。",
-      "code": "/* DMA 环形缓冲区 ADT 接口定义 */\ntypedef struct {\n    volatile uint16_t head;       /* DMA 中断更新（写指针）*/\n    volatile uint16_t tail;       /* 任务更新（读指针）*/\n    uint8_t *buffer;              /* 环形缓冲区存储 */\n    uint16_t size;                /* 缓冲区大小（2 的幂次方）*/\n    uint16_t mask;                /* size - 1，用于位运算取模 */\n    uint8_t overflow_flag;        /* 溢出标志 */\n} ringbuf_t;\n\n/* 公开接口 —— ADT 封装 */\nvoid ringbuf_init(ringbuf_t *rb, uint8_t *buf, uint16_t size);\nuint16_t ringbuf_count(const ringbuf_t *rb);\nuint16_t ringbuf_read(ringbuf_t *rb, uint8_t *out, uint16_t max_len);\nvoid ringbuf_advance_head(ringbuf_t *rb, uint16_t count);",
+      "difficulty": "advanced",
+      "tags": ["低功耗", "电源管理", "架构设计", "功耗分层"],
+      "explanation": "低功耗不是某个模块的优化，而是贯穿四个层级的系统工程。「优秀程序员的标志之一是追求优雅，而优雅的定义是去掉所有不必要的东西。」——《UNIX编程艺术》第8章",
+      "content": "低功耗设计必须从系统级视角切入，按照功耗贡献量从大到小分为四个层级。硅片层决定功耗天花板，比如 ARM Cortex-M0+ 的静态电流约为 5uA/MHz，Cortex-M4 约 15uA/MHz，Cortex-M7 约 30uA/MHz。选择芯片时，先看 datasheet 中 Active current @ 1MHz 和 Stop mode standby current 两个指标，前者决定跑代码时的功耗下限，后者决定休眠时的功耗底线。板级层关注外围器件的漏电流，LDO 的静态电流通常在 1~50uA 之间，DC-DC 转换器在轻载时效率急剧下降，如果负载只有 1mA，DC-DC 的效率可能跌至 40% 以下，此时 LDO 反而更省电。固件层通过时钟门控、外设禁用、DMA 替代 CPU 轮询等手段降低动态功耗。应用层则决定系统行为，比如传感器采样频率从 100Hz 降到 10Hz，CPU 唤醒间隔从 10ms 拉到 100ms，整体功耗可下降一个数量级。没有银弹，四层必须协同优化。",
+      "code": "/* 伪代码：四层功耗决策树 */\nstruct power_budget {\n    uint32_t silicon_uaw;\n    uint32_t board_uaw;\n    uint32_t fw_active_uaw;\n    float duty_cycle;\n};\n\nvoid evaluate_power_layers(struct power_budget *b) {\n    if (b->silicon_uaw > 20) {\n        log_warn(\"M4+ above, static high\");\n    }\n    if (b->board_uaw > b->silicon_uaw * 2) {\n        log_error(\"LDO static > chip 2x\");\n    }\n    uint32_t avg = b->fw_active_uaw * b->duty_cycle;\n    log_info(\"avg power %lu uA\", avg);\n}",
       "pitfalls": [],
       "refBook": [
-        "《UNIX编程艺术》ch10「管道与过滤器模式」",
-        "《C语言接口与实现》ch3「抽象数据类型」",
-        "《人月神话》ch9「计划再计划」"
+        "《UNIX编程艺术》ch8",
+        "《人月神话》ch5"
       ]
     },
     {
-      "id": "2026-05-05-dma-snippet",
-      "title": "DMA + UART 环形缓冲区：ISR 头指针更新代码",
-      "topic": "DMA环形缓冲区",
+      "id": "2026-05-05-lowpower-snippet",
+      "title": "STOP 模式切换：时钟配置与唤醒中断的正确顺序",
+      "topic": "低功耗设计",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["DMA", "UART", "环形缓冲区", "ISR", "__DSB", "volatile"],
-      "explanation": "这段代码展示了 DMA 环形缓冲区 ISR 中 head 指针更新的标准写法。关键点：① `__DSB()` 是必须的——Cortex-M7 有 Data Cache，DMA 写入的内存如果没有 DSB 屏障，CPU 可能读到 stale 数据；② 使用位运算掩码替代取模运算（`(head + 1) & RING_MASK`），比 `% RING_SIZE` 快 5-10 个时钟周期；③ 溢出检测用差值法：如果 head 相对于 tail 前进超过缓冲区一半，说明 CPU 太慢、数据被覆盖了。「硬件工程师用示波器看波形，软件工程师用寄存器看真相——两者结合才能做出可靠的系统。」——《代码大全》第 18 章「嵌入式编程实践」。",
-      "content": "这段代码是 DMA UART 接收中断回调中的环形缓冲区 head 更新逻辑。场景：STM32F429，UART3 绑定 DMA2 Channel 1，波特率 115200，缓冲区大小 512 字节（2^9）。DMA 配置为 Circular 模式 + PeriphToMemory 方向。中断优先级 NVIC_SetPriority(USART3_IRQn, 5)（数字越大优先级越低）。回调函数 `HAL_UART_RxCpltCallback` 在每次 DMA 传输完成时被调用——在 Circular 模式下，这意味着每 512 字节触发一次 TC 中断。ISR 的职责是：① 读取 DMA 的 CNDTR 寄存器计算本次传输了多少字节；② 更新 head 指针（用位运算掩码）；③ 调用 `__DSB()` 确保内存可见性；④ 检查溢出。关键细节：不要在 ISR 中调用任何可能阻塞的函数（如 HAL_Delay、printf、malloc），这会破坏实时性。",
-      "code": "/* dma_ringbuf_isr.c — DMA UART 接收中断回调 */\n#include <stdint.h>\n#include <stm32f4xx_hal.h>\n\n#define RING_SIZE 512\n#define RING_MASK (RING_SIZE - 1)\n\nstatic volatile uint16_t rx_head = 0;\nstatic uint8_t rx_buffer[RING_SIZE]\n    __attribute__((aligned(8)));\n\n/* ISR 中更新 head 指针的标准写法 */\nvoid uart_dma_rx_complete(UART_HandleTypeDef *huart) {\n    /* 第 1 步：读取 DMA CNDTR 计算已传输字节数 */\n    uint32_t cndtr = __HAL_DMA_GET_COUNTER(\n        &hdma_usart3_rx);\n    uint16_t transferred = RING_SIZE - (uint16_t)cndtr;\n\n    /* 第 2 步：用位运算推进 head 指针 */\n    uint16_t prev_head = rx_head;\n    rx_head = (prev_head + transferred) & RING_MASK;\n\n    /* 第 3 步：DSB 屏障 — 确保 DMA 写入对 CPU 可见 */\n    /* Cortex-M7 有 Data Cache，必须同步 */\n    __DSB();\n\n    /* 第 4 步：溢出检测 — head 超过 tail 一半 */\n    static uint16_t prev_prev_head = 0;\n    if ((rx_head - prev_prev_head) & RING_MASK\n            > RING_SIZE / 2) {\n        /* CPU 处理太慢，数据被覆盖 */\n        rx_buffer[prev_head] = 0xFF; /* 标记溢出 */\n    }\n    prev_prev_head = prev_head;\n}",
+      "tags": ["STOP模式", "时钟配置", "唤醒中断", "HAL库"],
+      "explanation": "进入 STOP 模式前必须确保唤醒源已配置且中断优先级高于主程序，否则唤醒后会直接跳回休眠。「如果你不能正确地做，那么快速去做也没有意义。」——《代码大全》第18章",
+      "content": "以 STM32L4 系列为例，进入 STOP 模式的标准流程是：1) 将 PWR 电压标度调至 Range 2（降低内核电压，功耗降低约 30%）；2) 配置 RTC 或 EXTI 为唤醒源；3) 调用 HAL_PWR_EnterSTOPMode()，内部执行 __WFE() 指令；4) 唤醒后 HSI16 自动作为系统时钟源，需重新配置 PLL 并切回 HSE；5) 恢复电压标度。关键陷阱：唤醒后的第一个中断服务函数必须在进入 STOP 之前就已使能，否则唤醒时中断标志丢失。",
+      "code": "/* 进入 STOP 模式的正确流程 */\nvoid enter_stop_mode(void) {\n    /* 1. 降电压标度到 Range 2 */\n    HAL_PWREx_ControlVoltageScaling(\n        PWR_REGULATOR_VOLTAGE_SCALE2\n    );\n    /* 2. 配置 RTC 闹钟中断为唤醒源 */\n    __HAL_RTC_ALARM_ENABLE_IT(&hrtc, RTC_IT_ALRA);\n    /* 3. 使能 PWR CLK */\n    __HAL_RCC_PWR_CLK_ENABLE();\n    /* 4. 清除 wakeup 标志 */\n    __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);\n    /* 5. 设置 EXTI Line22 为中断模式 */\n    HAL_NVIC_SetPriority(RTC_WKUP_IRQn, 2, 0);\n    HAL_NVIC_EnableIRQ(RTC_WKUP_IRQn);\n    /* 6. 进入 STOP 模式 */\n    HAL_PWR_EnterSTOPMode(\n        PWR_LOWPOWERREGULATOR_ON,\n        PWR_STOPENTRY_WFE\n    );\n    /* 唤醒后从这里继续执行 */\n    /* 7. 恢复电压标度 */\n    HAL_PWREx_ControlVoltageScaling(\n        PWR_REGULATOR_VOLTAGE_SCALE1\n    );\n    /* 8. 重新配置系统时钟 */\n    SystemClock_Config();\n}",
       "pitfalls": [
-        "陷阱 1：缺少 __DSB() 屏障。触发条件：Cortex-M7 核，-O2 优化。症状：DMA 写入的数据 CPU 读到旧值，表现为偶尔丢字节或乱码。修复：在更新 rx_head 后立即调用 __DSB()，确保 DMA 写入的内存对所有核心可见。",
-        "陷阱 2：缓冲区未对齐 8 字节。触发条件：Cortex-M7 有 Data Cache，DMA 直接写入未对齐内存。症状：HardFault 或随机字节错位。修复：使用 __attribute__((aligned(8))) 声明缓冲区，并在更新 head 后调用 SCB_CleanDCache_by_Addr()。",
-        "陷阱 3：用 % 运算符替代位运算掩码。触发条件：缓冲区大小不是 2 的幂次方。症状：性能下降 5-10 倍（取模是慢操作），ISR 耗时过长导致 DMA 溢出。修复：缓冲区大小必须是 2 的幂次方，用 (ptr + n) & MASK 替代 %。"
+        "未清除 PWR_FLAG_WU 标志 -> 唤醒后立即再次进入 STOP 死循环 -> 示波器测 VDD 电流出现周期性尖峰每次约 10ms 间隔",
+        "唤醒后未恢复电压标度就调用高频率外设 -> HSI16 在 16MHz 下 Range 2 电压不足导致 SPI 通信失败 -> 外设初始化成功但传输数据错误",
+        "中断优先级设为主程序之后 -> 唤醒后先执行主循环而非 ISR 错过唤醒事件 -> RTC 闹钟触发但应用层逻辑延迟 100ms 才响应"
       ],
       "refBook": [
-        "《代码大全》ch18「嵌入式编程实践」",
-        "《C陷阱与缺陷》ch5「未定义行为」"
+        "《代码大全》ch18",
+        "《C陷阱与缺陷》ch4"
       ]
     },
     {
-      "id": "2026-05-05-dma-tip",
-      "title": "DMA 环形缓冲区的 8 个致命陷阱",
-      "topic": "DMA环形缓冲区",
+      "id": "2026-05-05-lowpower-tips",
+      "title": "低功耗踩坑：三个让电流表爆炸的场景",
+      "topic": "低功耗设计",
       "mode": "tip",
       "language": "C",
-      "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
       "snippetType": "note",
-      "difficulty": "advanced",
-      "tags": ["DMA", "环形缓冲区", "陷阱", "竞态", "Cache一致性", "溢出"],
-      "explanation": "「乐观估计是嵌入式开发中最常见的错误来源。」——《人月神话》第 9 章「计划再计划」。DMA 环形缓冲区看似简单（一个数组 + 两个指针），但实际工程中至少有 8 个地方会踩坑。以下陷阱按从最常见到最隐蔽的顺序排列，每个都附带精确的触发条件和可操作的修复方法。",
-      "content": "**陷阱 1：volatile 缺失导致编译器优化掉 head 读取。** 触发条件：`rx_head` 声明为 `uint16_t` 而非 `volatile uint16_t`，开启 -O2 或 -O3 优化。症状：任务中 `while (ringbuf_count() == 0);` 变成死循环——编译器缓存了 `rx_head` 的初始值（0），永远认为缓冲区为空。修复：`rx_head` 和 `rx_tail` 都必须声明为 `volatile`。或者在每次读取前加 `__DMB()` 屏障。\n\n**陷阱 2：缓冲区大小非 2 的幂次方导致位运算掩码失效。** 触发条件：定义了 `#define RING_SIZE 256 + 64`（= 320）或手动输入了 300。症状：`(head + 1) & 299` 计算出错误的索引，读到脏数据或越界访问。修复：缓冲区大小必须是 2 的幂次方。在 `ringbuf_init` 中加断言 `assert((size & (size - 1)) == 0)`，不满足则报错。\n\n**陷阱 3：DMA Circular 模式下 CNDTR 重载的时序窗口。** 触发条件：DMA 传输到最后一个字节（CNDTR=1）的瞬间 ISR 被触发。症状：`transferred = RING_SIZE - CNDTR = RING_SIZE - 1`，但下一次 ISR 读到 `CNDTR = RING_SIZE`（重载后），`transferred = 0`，head 回退到之前的位置，导致重复读取或漏读。修复：不在 ISR 中通过 CNDTR 计算 transferred，改用步进累加：`static uint16_t step = 0; step = (step + 1) & RING_MASK; rx_head = (rx_head + 1) & RING_MASK;`——每收到一个字节推进一次。\n\n**陷阱 4：应用层 while(avail > 0) 循环中 head 被 ISR 更新导致死锁。** 触发条件：任务中读取 `avail = ringbuf_count()` 后进入 `while (avail--)` 循环，ISR 在此期间更新了 head。症状：avail 持续增长，任务死锁在读取循环中，CPU 占用率 100%。修复：使用快照模式——先读 head_snapshot 和 tail_snapshot 到局部变量，循环中使用快照值而非实时 count。\n\n**陷阱 5：Cortex-M7 Cache 一致性崩溃。** 触发条件：STM32H7 系列（M7 核带 D-Cache），DMA 写入缓冲区地址未对齐到 Cache Line（8 字节）。症状：DMA 写入的数据在 CPU 侧读取时出现随机字节错位，仅在高负载下出现，低负载正常。修复：① 缓冲区声明 `__attribute__((aligned(8)))`；② ISR 中 DMA 写入后调用 `SCB_CleanDCache_by_Addr(rx_buffer, RING_SIZE, 0)` 清理 Cache。\n\n**陷阱 6：DMA 优先级高于任务导致 ISR 饥饿。** 触发条件：DMA/UART 中断优先级设为 0（最高），应用任务优先级设为 5。症状：ISR 频繁抢占任务，任务中的非临界代码（如协议解析）被无限延迟。修复：DMA 中断优先级设为 3-5，应用任务优先级设为 1-2。中断只负责搬运数据，解析逻辑应该在任务中顺序执行。\n\n**陷阱 7：半传输（HT）和全传输（TC）中断同时使能但未区分。** 触发条件：DMA 配置了 HT 和 TC 中断，但回调函数中没有判断是 HT 还是 TC。症状：HT 和 TC 混在一起更新 head，导致 head 推进速度翻倍，缓冲区管理混乱。修复：在回调中通过 `huart->State` 或 DMA 状态寄存器判断中断来源，HT 回调和 TC 回调分别处理。\n\n**陷阱 8：malloc 分配的缓冲区在静态链接时超出 RAM 限制。** 触发条件：在 `ringbuf_init` 中调用 `malloc(RING_SIZE)` 动态分配缓冲区。症状：链接时 `.bss` 段过大导致链接失败，或运行时 heap 碎片化导致 malloc 返回 NULL 但调用方未检查。修复：环形缓冲区应在编译时静态分配（全局数组或 static 变量），大小在 `#define` 中管理。动态分配仅适用于缓冲区大小运行时可变的高级场景。",
-      "code": "/* 陷阱 4 修复：快照模式避免死锁 */\n#include <stdint.h>\n\nstatic volatile uint16_t rx_head = 0;\nstatic volatile uint16_t rx_tail = 0;\n\n/* 安全的读取循环 —— 使用快照避免 ISR 干扰 */\nuint16_t safe_read_loop(void) {\n    /* 第 1 步：快照 head 和 tail */\n    uint16_t h = rx_head;\n    uint16_t t = rx_tail;\n\n    /* 第 2 步：计算可用字节数（基于快照）*/\n    uint16_t avail = (h >= t) ? (h - t) : \n                     (512 - t + h);\n\n    /* 第 3 步：使用快照值循环读取 */\n    uint16_t read_count = 0;\n    for (uint16_t i = 0; i < avail; i++) {\n        /* 基于快照的 tail 索引，不会被 ISR 干扰 */\n        uint16_t idx = (t + read_count) & 511;\n        process_byte(rx_buffer[idx]);\n        read_count++;\n    }\n\n    /* 第 4 步：原子性地推进 tail */\n    rx_tail = (rx_tail + read_count) & 511;\n    __DSB();\n    return read_count;\n}",
+      "difficulty": "intermediate",
+      "tags": ["低功耗", "电流测量", "调试陷阱", "功耗优化"],
+      "explanation": "计划再计划的本质是承认我们对复杂系统的直觉是错的。在功耗优化中尤其如此，你以为关闭了一个外设就省了 1mA，结果发现另一个外设因为时钟泄漏又吞回去了。「没有银弹——软件工程的本质性工作在可预见的将来不会消失。」——《人月神话》第9章",
+      "content": "陷阱一：浮空引脚吞噬电流。STM32L4 在 STOP 模式下，任何未配置的 GPIO 如果处于浮空状态，其内部施密特触发器会持续消耗电流。实测发现，一个 8 引脚浮空的 MCU 在 STOP 模式下电流从 0.5uA 飙到 15uA。修复方法：将所有未使用引脚配置为模拟输入 GPIO_MODE_ANALOG，这是 datasheet 明确推荐的最低功耗配置。陷阱二：调试接口泄漏。SWD 接口的 SWCLK/SWDIO 引脚在调试器连接时会引入约 50uA 的泄漏电流。即使不烧录代码，只要调试器插在板上，MCU 就无法进入深度睡眠。修复方法：硬件上串联 10k 电阻隔离 SWD 信号线，软件上在 STOP 前调用 HAL_DBGMCU_DisableDBGStopMode()。陷阱三：RC 振荡器未关闭。某些 MCU 的 LSI/LRC 振荡器用于 RTC 和看门狗，默认上电后一直运行。在 STOP 模式下 LSI 仍然工作，消耗约 40uA。修复方法：如果不需要 RTC，在初始化阶段关闭 LSI __HAL_RCC_LSI_DISABLE()。",
+      "code": "/* 正确配置 GPIO 为模拟模式以降低泄漏 */\nvoid configure_unused_gpios(void) {\n    GPIO_InitTypeDef gpio = {0};\n    gpio.Mode = GPIO_MODE_ANALOG;\n    gpio.Pull = GPIO_NOPULL;\n    gpio.Pin = GPIO_PIN_0 | GPIO_PIN_1 |\n               GPIO_PIN_2 | GPIO_PIN_3 |\n               GPIO_PIN_4 | GPIO_PIN_5 |\n               GPIO_PIN_6 | GPIO_PIN_7;\n    HAL_GPIO_Init(GPIOB, &gpio);\n    /* 关闭未使用的时钟域 */\n    __HAL_RCC_CRC_CLK_DISABLE();\n    __HAL_RCC_BKP_RAM_CLK_DISABLE();\n}",
       "pitfalls": [
-        "陷阱 1：volatile 缺失。触发条件：rx_head 声明为 uint16_t 而非 volatile，-O2 优化。症状：ringbuf_count() 永远返回 0，任务死循环。修复：声明为 volatile uint16_t。",
-        "陷阱 2：缓冲区大小非 2 的幂次方。触发条件：RING_SIZE = 300。症状：(head+1) & 299 计算错误索引，读到脏数据。修复：init 中 assert((size & (size-1)) == 0)。",
-        "陷阱 3：CNDTR 重载时序窗口。触发条件：DMA 传输到最后一字节时 ISR 被触发。症状：transferred 从 RING_SIZE-1 跳变到 0，head 回退。修复：用步进累加替代 CNDTR 计算。",
-        "陷阱 4：应用层 while(avail>0) 中 head 被 ISR 更新。触发条件：任务读取 avail 后进入循环，ISR 更新 head 使 avail 增长。症状：死循环，CPU 100%。修复：快照模式——先读 head/tail 到局部变量再循环。",
-        "陷阱 5：M7 Cache 一致性。触发条件：STM32H7 M7 核，DMA 写入未对齐 8 字节。症状：CPU 读到错位数据，仅高负载出现。修复：__attribute__((aligned(8))) + SCB_CleanDCache_by_Addr()。",
-        "陷阱 6：DMA 优先级过高。触发条件：UART 中断优先级 0，任务优先级 5。症状：ISR 频繁抢占，协议解析被无限延迟。修复：中断优先级 3-5，任务优先级 1-2。",
-        "陷阱 7：HT/TC 中断未区分。触发条件：同时使能 HT 和 TC 中断但回调中不判断来源。症状：head 推进速度翻倍，缓冲区混乱。修复：通过 DMA 状态寄存器区分 HT 和 TC。",
-        "陷阱 8：malloc 分配缓冲区。触发条件：ringbuf_init 中调用 malloc。症状：链接失败或运行时 NULL 未检查。修复：静态分配全局数组，大小用 #define 管理。"
+        "浮空 GPIO 在 STOP 模式下消耗 10-50uA -> 电流表显示 STOP 模式电流远超 datasheet 标称值 -> 将所有未用 GPIO 配置为 GPIO_MODE_ANALOG",
+        "SWD 调试器连接时引入 50uA 泄漏 -> 拔掉 USB 后电流仍不下降 -> 硬件加 10k 串联电阻 + 软件禁用 DBGStopMode",
+        "LSI 振荡器在 STOP 下仍运行消耗 40uA -> RTC 未使用时电流异常 -> __HAL_RCC_LSI_DISABLE() 关闭 LSI 改用 LSE 晶振功耗仅 0.8uA"
       ],
       "refBook": [
-        "《人月神话》ch9「计划再计划」",
-        "《C陷阱与缺陷》ch2「预处理器」ch5「未定义行为」",
-        "《代码大全》ch5「防御性编程」"
+        "《人月神话》ch9",
+        "《C陷阱与缺陷》ch2"
       ]
     },
     {
-      "id": "2026-05-05-dma-refactor",
-      "title": "从裸 DMA 回调到 ADT 环形缓冲区：重构示范",
-      "topic": "DMA环形缓冲区",
+      "id": "2026-05-05-lowpower-refactor",
+      "title": "从忙等待到事件驱动：功耗重构实战",
+      "topic": "低功耗设计",
       "mode": "refactor",
       "language": "C",
       "platform": "STM32HAL",
       "toolchain": "HAL",
-      "snippetType": "pattern",
+      "snippetType": "algorithm",
       "difficulty": "intermediate",
-      "tags": ["DMA", "环形缓冲区", "重构", "ADT", "volatile", "快照模式"],
-      "explanation": "「首先，正确地做；然后，快速地做。」——《重构》第 2 版前言。这段重构展示了如何将散落在各个驱动文件中的 DMA 回调逻辑提取为统一的环形缓冲区 ADT。核心改动：将裸的 `HAL_UART_RxCpltCallback` 中的 head 更新逻辑封装为 `ringbuf_advance_head()`，将散落各处的 `ringbuf_count()` 实现统一为快照模式。代价是：增加了 `ringbuf_t` 结构体的间接寻址开销（约 3 条额外指令），但换来了可复用的缓冲区和可测试的接口。「清晰的接口比聪明的实现更重要——三年后维护你代码的人会感谢你。」——《UNIX编程艺术》第 2 章「设计原则」。",
-      "content": "重构前的代码有两个明显的坏味道：① **重复逻辑**——UART2、UART3、SPI2 的 DMA 回调中各自实现了相似的 head 更新逻辑（读 CNDTR → 计算 transferred → 更新指针 → __DSB()），三个文件几乎一模一样；② **魔法数字**——缓冲区大小 256/512/1024 散落在各驱动文件中，没有集中管理，修改缓冲区大小需要改 3 个文件。\\n\\n重构后采用《C语言接口与实现》中的 ADT 模式：`ringbuf_t` 封装了 head/tail 指针、缓冲区存储、大小和掩码。三个 DMA 通道各自拥有一个 `ringbuf_t` 实例，通过 `ringbuf_init()` 统一初始化。DMA 回调中不再直接操作 head 指针，而是调用 `ringbuf_advance_head(rb, count)`——这个函数内部处理了位运算掩码、溢出检测和 `__DSB()` 屏障。\\n\\n**代价分析**：① 每次 head 更新增加 3 条指令的函数调用开销（ARM GCC 内联后可消除）；② `ringbuf_t` 结构体增加 16 字节/实例的静态内存占用（3 个实例 = 48 字节）；③ 接口复杂度增加——调用方需要理解 `ringbuf_t` 的生命周期（init → 自动运行 → 可选 reset）。但对于可维护性的提升，这个代价微不足道。",
-      "code": "/* ===== 重构前：每个驱动重复写同样的 head 更新 ===== */\n\n/* UART2 DMA 回调 */\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    if (huart->Instance == UART2) {\n        uint32_t cndtr = __HAL_DMA_GET_COUNTER(&hdma_usart2_rx);\n        uint16_t transferred = 256 - (uint16_t)cndtr;\n        rx2_head = (rx2_head + transferred) & 255;\n        __DSB();  /* 每个驱动都写一遍 */\n    }\n}\n\n/* UART3 DMA 回调 —— 同样的逻辑 */\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    if (huart->Instance == UART3) {\n        uint32_t cndtr = __HAL_DMA_GET_COUNTER(&hdma_usart3_rx);\n        uint16_t transferred = 512 - (uint16_t)cndtr;\n        rx3_head = (rx3_head + transferred) & 511;\n        __DSB();  /* 又写一遍 */\n    }\n}\n\n/* ===== 重构后：统一的环形缓冲区 ADT ===== */\n\ntypedef struct {\n    volatile uint16_t head;\n    volatile uint16_t tail;\n    uint8_t *buffer;\n    uint16_t size;\n    uint16_t mask;\n} ringbuf_t;\n\nstatic ringbuf_t uart2_rb, uart3_rb;\n\n/* 初始化 —— 集中管理缓冲区大小 */\nvoid ringbuf_init(ringbuf_t *rb,\n                  uint8_t *buf, uint16_t size) {\n    rb->buffer = buf;\n    rb->size = size;\n    rb->mask = size - 1;\n    rb->head = 0;\n    rb->tail = 0;\n}\n\n/* 统一的 head 更新 —— 一次编写，多处复用 */\nstatic void ringbuf_advance_head(\n    ringbuf_t *rb, uint16_t count) {\n    rb->head = (rb->head + count) & rb->mask;\n    __DSB();  /* 只在 ADT 内部 */\n}\n\n/* DMA 回调 —— 干净简洁 */\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    uint32_t cndtr = __HAL_DMA_GET_COUNTER(\n        &hdma_usart2_rx);\n    uint16_t xfer = 256 - (uint16_t)cndtr;\n    ringbuf_advance_head(&uart2_rb, xfer);\n}",
+      "tags": ["低功耗", "重构", "事件驱动", "忙等待消除"],
+      "explanation": "重构的本质不是重写，而是逐步改进。每次改动都应该让系统更清晰更可测试更低功耗。「任何傻瓜都能写出计算机可以理解的代码，好的程序员写出人类可以理解的代码。」——《重构》第2章",
+      "content": "原始代码采用轮询方式检测传感器数据：主循环每 10ms 调用一次 HAL_ADC_Start() 读取温度传感器，即使数据没有更新也反复采样。这种忙等待模式导致 CPU 无法进入低功耗状态，平均电流约 800uA。重构方案：改用 ADC 转换完成中断加 DMA 双缓冲机制，主循环仅在收到新数据标志时才处理，其余时间调用 HAL_PWR_EnterSTOPMode()。重构后平均电流降至 15uA，降幅达 98%。代价：代码复杂度增加，需要维护 DMA 双缓冲区和中断同步逻辑，调试难度上升。但这是值得的，功耗降低两个数量级，电池寿命从几天延长到几个月。",
+      "code": "/* 重构前：忙等待轮询，功耗 800uA */\nwhile (1) {\n    HAL_ADC_Start(&hadc1);\n    HAL_ADC_PollForConversion(&hadc1, 10);\n    temp = HAL_ADC_GetValue(&hadc1);\n    process_temperature(temp);\n    HAL_Delay(10);\n}\n\n/* 重构后：中断+DMA 事件驱动，功耗 15uA */\nvolatile bool new_data_ready = false;\nuint16_t adc_buf[2];\nuint8_t buf_idx = 0;\n\nvoid HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *h) {\n    adc_buf[buf_idx] = HAL_ADC_GetValue(h);\n    buf_idx = !buf_idx;\n    new_data_ready = true;\n}\n\nint main(void) {\n    HAL_ADC_Start_DMA(&hadc1, adc_buf, 2);\n    while (1) {\n        if (new_data_ready) {\n            new_data_ready = false;\n            process_temperature(adc_buf[!buf_idx]);\n        }\n        __HAL_RCC_PWR_CLK_ENABLE();\n        HAL_PWR_EnterSTOPMode(\n            PWR_LOWPOWERREGULATOR_ON,\n            PWR_STOPENTRY_WFI\n        );\n        SystemClock_Config();\n    }\n}",
       "pitfalls": [
-        "陷阱 1：malloc 返回的缓冲区未对齐到 8 字节。症状：STM32H7 M7 DMA 访问未对齐内存触发 HardFault。修复：使用 __attribute__((aligned(8))) 或静态分配。",
-        "陷阱 2：ringbuf_advance_head 中未调用 __DSB()。症状：Cortex-M7 读到 stale 数据，DMA 写入对 CPU 不可见。修复：在 head 更新后必须调用 __DSB()。",
-        "陷阱 3：快照模式中 head/tail 读取未用局部变量。症状：ISR 在循环中更新 head 导致死锁。修复：先读 head_snapshot 和 tail_snapshot 到局部变量，循环中使用快照值。"
+        "DMA 缓冲区切换时未关中断 -> 中断在切换瞬间触发导致读到旧数据 -> 在 buf_idx 切换前后用 __disable_irq()/__enable_irq() 保护临界区",
+        "STOP 模式唤醒后未重新配置 DMA -> DMA 计数器丢失后续转换数据错位 -> 唤醒后调用 HAL_ADC_Start_DMA() 重新初始化 DMA 通道",
+        "process_temperature() 耗时超过采样周期 -> 新数据覆盖旧数据导致丢包 -> 增加环形缓冲区或使用双缓冲区的生产者消费者模型"
       ],
       "refBook": [
-        "《重构》ch3「代码坏味道」",
-        "《UNIX编程艺术》ch2「设计原则」",
-        "《C语言接口与实现》ch3「抽象数据类型」"
+        "《重构》ch2",
+        "《UNIX编程艺术》ch3"
       ]
     }
   ]
