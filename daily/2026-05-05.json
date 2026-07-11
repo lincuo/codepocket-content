@@ -1,99 +1,87 @@
 {
   "date": "2026-05-05",
-  "topic": "DMA + 循环缓冲区的正确姿势",
+  "topic": "FreeRTOS 任务间通信的坑",
   "items": [
     {
-      "id": "2026-05-05-dma-circular-arch",
-      "title": "DMA 循环缓冲区的架构设计：零拷贝数据流的基石",
+      "id": "2026-05-05-freertos-queue-arch",
+      "title": "FreeRTOS 队列架构：用消息传递替代共享内存",
       "mode": "architecture",
       "language": "C",
-      "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "FreeRTOS",
       "snippetType": "pattern",
-      "difficulty": "advanced",
-      "tags": ["DMA", "循环缓冲区", "零拷贝", "双缓冲", "UART"],
-      "explanation": "《UNIX编程艺术》ch9提出「做一件事并做好」的原则，在 DMA 循环缓冲区的语境下意味着：DMA 只负责搬运，应用层只负责消费，两者通过环形缓冲区这个「契约」交互。Schmidt 在《C语言接口与实现》ch3中定义的抽象数据类型思想在这里完美适用——缓冲区结构体封装了 head/tail 指针和大小，外部代码只能通过 enqueue/dequeue 接口操作，无法直接触碰内部状态。「接口是契约，实现是自由。」——《C语言接口与实现》第3章",
-      "content": "DMA 循环缓冲区是嵌入式系统中实现零拷贝数据流的核心模式。它的核心思想是用一块固定大小的 RAM 作为环形缓冲区，DMA 外设（如 UART RX）直接往这块缓冲区写入数据，当 DMA 传输到缓冲区末尾时自动回绕到起始地址——这就是 STM32 的 DMA_CIRCULAR 模式。\n\n架构上分为三个层次：最底层是 DMA 硬件配置，设置 DMA1_Channel5 指向 USART2_DR 地址(0x40004404)和缓冲区地址(0x20000000)，传输长度设为 BUFFER_SIZE(256 字节)，模式设为循环；中间层是环形缓冲区数据结构，用 uint8_t buf[256] + volatile uint16_t head + volatile uint16_t tail 实现，head 由 DMA 更新，tail 由应用层读取；最上层是数据消费 API，提供 buffer_available() 和 buffer_read() 两个接口。\n\n关键设计决策：缓冲区大小必须是 2 的幂次（推荐 256 或 512），这样 head % size 可以用位运算 head & (size-1) 替代除法，节省 MCU cycles。双缓冲模式（ping-pong）适合大数据量场景：DMA 交替填充两个缓冲区，当一个缓冲区满时触发 Transfer Complete 中断通知应用层处理，另一个缓冲区同时接收新数据。但双缓冲会增加复杂度——需要在中断中切换缓冲区索引，且应用层消费速度必须跟上 DMA 填充速度，否则会产生数据丢失。\n\n这种架构的代价：环形缓冲区需要处理 head 和 tail 交叉的情况（tail 追上 head 表示缓冲区为空，head 追上 tail 表示缓冲区满），应用层消费逻辑比简单队列复杂约 3 倍。正如 Brooks 在《人月神话》中指出的「没有银弹」——零拷贝消除了内存拷贝开销，但引入了竞态条件和边界条件处理的复杂度。当应用层消费速度跟不上 DMA 填充速度时，缓冲区会溢出，此时要么丢弃旧数据（tail 追赶 head），要么暂停 DMA 传输（需要额外的 DMA 控制寄存器操作）。",
-      "code": "/* === 环形缓冲区数据结构 === */\ntypedef struct {\n    uint8_t  buf[BUFFER_SIZE];     /* 256 字节缓冲区 */\n    volatile uint16_t head;        /* DMA 写入位置 */\n    volatile uint16_t tail;        /* 应用层读取位置 */\n} dma_ring_buf_t;\n\n/* 静态实例 —— 放在 DTCM 或 SRAM1 避免总线竞争 */\nstatic dma_ring_buf_t uart2_buf __attribute__((aligned(4)));\n\n/* === 初始化 === */\nvoid ring_buf_init(dma_ring_buf_t *rb) {\n    rb->head = 0;\n    rb->tail = 0;\n}\n\n/* === 数据消费接口 === */\nuint16_t ring_buf_available(const dma_ring_buf_t *rb) {\n    return rb->head - rb->tail;     /* 可用字节数 */\n}\n\nint ring_buf_read(dma_ring_buf_t *rb,\n                  uint8_t *out, uint16_t max_len) {\n    uint16_t avail = ring_buf_available(rb);\n    if (avail == 0) return -1;      /* 空缓冲区 */\n    uint16_t len = (max_len < avail) ? max_len : avail;\n    for (uint16_t i = 0; i < len; i++) {\n        out[i] = rb->buf[rb->tail & (BUFFER_SIZE - 1)];\n        rb->tail++;                 /* 推进 tail */\n    }\n    return (int)len;\n}",
+      "difficulty": "intermediate",
+      "tags": ["FreeRTOS", "队列", "任务通信", "消息传递", "互斥"],
+      "explanation": "Eric S. Raymond 在《UNIX编程艺术》第 9 章「模块原则」中写道：「构建软件时，让各部分之间通过清晰的接口通信，而不是共享状态。」FreeRTOS 队列正是这一原则的具现化——每个任务拥有自己的局部变量，任务间只通过 xQueueSend/xQueueReceive 交换消息。Schmidt 在《C语言接口与实现》第 3 章中定义的抽象数据类型思想同样适用：队列结构体封装了内部链表、计数器和信号量，外部代码只能通过 API 操作，无法直接触碰内部状态。「接口是契约，实现是自由。」——《C语言接口与实现》第 3 章",
+      "content": "FreeRTOS 提供了四种任务间通信机制：队列(Queue)、信号量(Semaphore)、事件组(Event Group)和通知(Notified)，每种都有明确的适用场景和陷阱。\n\n队列是最通用的通信原语。它本质上是带锁的 FIFO 缓冲区，支持多生产者多消费者。创建时使用 xQueueCreate(10, sizeof(my_msg_t))，第一个参数是深度（最多缓存 10 条消息），第二个参数是每个元素的大小。关键设计决策：队列深度应该根据生产者的突发频率来设定，而不是随意取 10。如果生产者每秒发送 100 条消息而消费者每秒处理 80 条，那么队列深度至少需要 20 才能吸收 200ms 的突发延迟。队列内部使用单向链表实现，每条消息在入队时被复制到队列存储区——这意味着发送方不需要保持消息存活。\n\n信号量用于同步而非数据传输。二值信号量类似互斥锁但不区分所有权，计数信号量可以限制并发访问数量。常见错误是用信号量代替队列传递数据——虽然技术上可行（xSemaphoreGive 可以携带指针参数），但这违反了接口的语义契约，会让维护者困惑。\n\n事件组适合一对多的广播场景。一个任务等待多个条件满足（如 EVENT_A | EVENT_B），另一个任务发出这些事件。EventGroup 内部用一个 uint32_t 位图存储事件状态，最多支持 32 个不同事件。\n\n任务通知是 FreeRTOS v8.2 引入的最轻量的点对点通信机制。它直接在 TCB 中存储一个 32 位值和 4 个事件位，零内存分配，零拷贝。但它的代价是只能一对一通信——一个任务只能被另一个任务通知，无法广播。\n\n架构权衡：队列提供最强的解耦能力但占用 RAM（每条消息 + 链表节点）；任务通知零开销但耦合度高；事件组适合广播但最多 32 个事件。Brooks 在《人月神话》中指出「没有银弹」——选择哪种机制取决于你的具体约束。如果你的 MCU 只有 64KB SRAM 且任务间通信频率低于 1kHz，任务通知可能是最佳选择；如果需要多对多通信且消息大小超过 4 字节，队列是唯一合理的选择。",
+      "code": "/* === 队列消息定义 === */\ntypedef struct {\n    uint32_t cmd;          /* 命令类型 */\n    uint16_t param;        /* 参数 */\n    uint8_t  data[32];     /* 负载数据 */\n} sensor_msg_t;\n\n/* === 队列实例 —— 深度 8，每条 sizeof(sensor_msg_t) === */\nstatic QueueHandle_t sensor_queue;\n\nvoid comms_init(void) {\n    sensor_queue = xQueueCreate(8, sizeof(sensor_msg_t));\n    configASSERT(sensor_queue);  /* 创建失败说明 RAM 不足 */\n}\n\n/* 生产者任务：采集传感器数据并发送到队列 */\nvoid sensor_task(void *pv) {\n    sensor_msg_t msg = {0};\n    while (1) {\n        msg.cmd = READ_ADC;\n        msg.param = ADC_CHANNEL_3;\n        msg.data[0] = HAL_ADC_GetValue(&hadc1);\n        /* xQueueSend 超时 10 tick —— 队列满时不阻塞，丢弃最新数据 */\n        if (xQueueSend(sensor_queue, &msg, pdMS_TO_TICKS(10)) != pdPASS) {\n            /* 队列满时递增丢包计数器 */\n            stats_drop_count++;\n        }\n        vTaskDelay(pdMS_TO_TICKS(50));  /* 20Hz 采样率 */\n    }\n}\n\n/* 消费者任务：从队列获取并处理 */\nvoid control_task(void *pv) {\n    sensor_msg_t msg;\n    while (1) {\n        /* xQueueReceive 阻塞等待 —— 队列为空时释放 CPU */\n        if (xQueueReceive(sensor_queue, &msg, portMAX_DELAY) == pdPASS) {\n            if (msg.cmd == READ_ADC) {\n                pid_update(msg.data[0]);  /* 更新 PID 控制器 */\n            }\n        }\n    }\n}",
       "pitfalls": [],
       "refBook": [
         "《UNIX编程艺术》ch9",
-        "《C语言接口与实现》ch3",
-        "《人月神话》ch1"
+        "《C语言接口与实现》ch3"
       ]
     },
     {
-      "id": "2026-05-05-dma-snippet",
-      "title": "UART2 DMA 循环接收的完整 HAL 配置代码",
+      "id": "2026-05-05-freertos-queue-snippet",
+      "title": "队列发送超时与优先级继承的正确用法",
       "mode": "snippet",
       "language": "C",
       "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "toolchain": "FreeRTOS",
       "snippetType": "driver",
-      "difficulty": "intermediate",
-      "tags": ["DMA", "UART", "HAL", "循环接收", "NVIC"],
-      "explanation": "这段代码展示了 DMA 循环接收的完整配置流程：初始化 UART2 时钟和 GPIO，配置 DMA1_Channel5 为循环模式指向 USART2_DR，启动 DMA 接收后立刻进入主循环消费数据。HAL 层的 HAL_UART_Receive_DMA() 内部调用了 HAL_DMA_Start_IT() 来使能 DMA 传输完成中断。McConnell 在《代码大全》ch17中指出「硬件初始化的顺序决定了系统的稳定性」——先配 GPIO 再开 DMA 时钟最后启动传输，这个顺序不能颠倒，否则 DMA 可能向未初始化的外设写入数据。「初始化顺序不是细节，而是契约的一部分。」——《代码大全》第17章",
-      "content": "UART2 使用 PA2(TX)/PA3(RX)，DMA1_Channel5 对应 USART2_RX。缓冲区大小 256 字节存放在 SRAM1(0x20000000 区域)。DMA 配置要点：外设地址是 USART2_DR (0x40004404)，内存地址是 ring_buf.buf，传输方向 Memory_to_Peripheral 用于 TX，Peripheral_to_Memory 用于 RX。RX 时 DMA_CIRCULAR 模式让 DMA 自动回绕，不需要在中断里重新调用 HAL_UART_Receive_DMA()。\n\n中断优先级配置：DMA1_Channel5_IRQn 设为优先级 3（数值越小优先级越高），UART2_IRQn（空闲中断 IDLE）设为优先级 5。这样 DMA 传输完成中断优先于 UART 空闲中断处理，确保数据完整性。在中断回调 HAL_UART_RxCpltCallback() 中不做任何耗时操作，只标记一个标志位告知主循环有数据可消费。\n\n代码在 STM32F407 + GCC ARM 工具链下编译通过，HAL 库版本 v1.27.0。",
-      "code": "/* dma_uart_rx.c — UART2 DMA 循环接收 */\n#include \"stm32f4xx_hal.h\"\n#include \"dma_ring_buf.h\"\n\n#define BUFFER_SIZE  256\n\nstatic UART_HandleTypeDef huart2;\nstatic DMA_HandleTypeDef hdma_usart2_rx;\nstatic dma_ring_buf_t uart2_rx_buf;\nstatic volatile uint8_t dma_flag = 0;  /* 数据就绪标志 */\n\n/* DMA 初始化：Channel5, Peripheral_to_Memory, Circular */\nstatic void dma_rx_init(void) {\n    __HAL_RCC_DMA2_CLK_ENABLE();\n    hdma_usart2_rx.Instance             = DMA2_Stream5;\n    hdma_usart2_rx.Init.Channel         = DMA_CHANNEL_4;\n    hdma_usart2_rx.Init.Direction       = DMA_PERIPH_TO_MEMORY;\n    hdma_usart2_rx.Init.PeriphInc       = DMA_PINC_DISABLE;\n    hdma_usart2_rx.Init.MemInc          = DMA_MINC_ENABLE;\n    hdma_usart2_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;\n    hdma_usart2_rx.Init.MemDataAlignment  = DMA_MDATAALIGN_BYTE;\n    hdma_usart2_rx.Init.Mode            = DMA_CIRCULAR;\n    hdma_usart2_rx.Init.Priority        = DMA_PRIORITY_HIGH;\n    HAL_DMA_Init(&hdma_usart2_rx);\n    __HAL_LINKDMA(&huart2, hdmarx, hdma_usart2_rx);\n    NVIC_SetPriority(DMA2_Stream5_IRQn, 3);\n    HAL_NVIC_EnableIRQ(DMA2_Stream5_IRQn);\n}\n\n/* UART2 初始化并启动 DMA 循环接收 */\nvoid uart2_dma_begin(void) {\n    __HAL_RCC_USART2_CLK_ENABLE();\n    __HAL_RCC_GPIOA_CLK_ENABLE();\n    /* PA2=TX, PA3=RX */\n    GPIO_InitTypeDef gi = {0};\n    gi.Pin   = GPIO_PIN_2 | GPIO_PIN_3;\n    gi.Mode  = GPIO_MODE_AF_PP;\n    gi.Pull  = GPIO_PULLUP;\n    gi.Speed = GPIO_SPEED_FREQ_HIGH;\n    gi.Alternate = GPIO_AF7_USART2;\n    HAL_GPIO_Init(GPIOA, &gi);\n\n    huart2.Instance          = USART2;\n    huart2.Init.BaudRate     = 115200;\n    huart2.Init.WordLength   = UART_WORDLENGTH_8B;\n    huart2.Init.StopBits     = UART_STOPBITS_1;\n    huart2.Init.Parity       = UART_PARITY_NONE;\n    huart2.Init.Mode         = UART_MODE_TX_RX;\n    HAL_UART_Init(&huart2);\n\n    dma_rx_init();\n    ring_buf_init(&uart2_rx_buf);\n\n    /* 启动 DMA 循环接收：数据写入 ring_buf.buf */\n    HAL_UART_Receive_DMA(&huart2,\n        (uint8_t*)uart2_rx_buf.buf,\n        BUFFER_SIZE);\n}\n\n/* DMA 传输完成回调：仅设标志，不做耗时操作 */\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    if (huart->Instance == USART2)\n        dma_flag = 1;  /* 告诉主循环有数据 */\n}\n\n/* 主循环消费示例 */\nint main(void) {\n    HAL_Init();\n    uart2_dma_begin();\n    uint8_t tmp[64];\n    while (1) {\n        if (dma_flag) {\n            dma_flag = 0;\n            uint16_t avail = ring_buf_available(\n                &uart2_rx_buf);\n            if (avail > 0) {\n                int n = ring_buf_read(\n                    &uart2_rx_buf, tmp,\n                    (avail < 64) ? avail : 64);\n                /* 处理 n 字节数据 */\n            }\n        }\n    }\n}",
-      "pitfalls": [
-        "DMA_CIRCULAR 模式下 HAL_UART_Receive_DMA() 的第三参数 length 被忽略——DMA 硬件不检查这个值，它只认 DMA_SxCR 寄存器中的 NDTR 字段。如果误以为传 128 就只收 128 字节然后停止，会导致程序永远收不到后续数据",
-        "ring_buf.buf 没有声明为 volatile 或放在 DMA 可见的内存区域——DMA 直接写 RAM 但编译器不知道这个内存被外部修改，优化级别 -O2 下编译器可能缓存 buf 的值到寄存器，导致 ring_buf_available() 读到过期值",
-        "HAL_UART_RxCpltCallback() 中调用了 HAL_UART_Transmit() 发送响应——DMA 正在 RX 过程中，TX 操作会修改 DMA_SxNDTR 寄存器导致当前 DMA 传输计数错乱，症状是 DMA 提前结束或数据截断"
-      ],
+      "difficulty": "advanced",
+      "tags": ["FreeRTOS", "队列", "优先级继承", "死锁预防", "STM32"],
+      "explanation": "McConnell 在《代码大全》第 18 章「防御性编程」中强调：「永远不要假设你的代码会在理想条件下运行。」在 FreeRTOS 中，xQueueSend 的超时参数就是防御性编程的关键——不设置超时意味着如果队列满了，发送任务会无限期挂起，这可能触发看门狗复位或导致系统死锁。「宁可缓慢地正确，也不要快速地崩溃。」——《代码大全》第 18 章",
+      "content": "以下是 FreeRTOS 队列在 STM32 HAL 环境下的完整使用示例，涵盖生产者-消费者模式、超时处理和优先级继承。\n\n关键配置：在 FreeRTOSConfig.h 中确保 configUSE_MUTEXES 设置为 1（启用互斥锁以支持优先级继承），configQUEUE_REGISTRY_SIZE 设置为至少 10（便于调试时追踪队列）。STM32 的 IRQHandler 中调用 FreeRTOS API 时必须确保中断优先级低于 configMAX_SYSCALL_INTERRUPT_PRIORITY（通常是 NVIC_PRIO_5，即优先级数值 >= 5，因为 STM32 使用 4 位优先级且数值越小优先级越高）。\n\n中断服务程序中只能调用以 FromISR 后缀的 API（如 xQueueSendFromISR），这些 API 内部会自动触发上下文切换判断。普通 API（如 xQueueSend）在中断中调用会导致 HardFault——因为普通 API 可能引发任务调度，而中断上下文中不允许调度。\n\n优先级继承：当低优先级任务持有互斥锁(xSemaphoreCreateMutex())，高优先级任务尝试获取该锁时会暂时继承低优先级的优先级，防止优先级反转。注意：二值信号量(xSemaphoreCreateBinary())不支持优先级继承，只有互斥锁支持。",
+      "code": "/* === 互斥锁 —— 用于保护共享资源 === */\nstatic SemaphoreHandle_t xSharedMutex;\n\n/* === 中断安全的数据通道 === */\nstatic QueueHandle_t xISRToTaskQ;\n\nvoid SystemInit(void) {\n    xSharedMutex = xSemaphoreCreateMutex();\n    xISRToTaskQ = xQueueCreate(4, sizeof(uint32_t));\n}\n\n/* === 中断服务程序 (SPI Rx DMA 完成中断) === */\nvoid DMA2_Stream3_IRQHandler(void) {\n    HAL_DMA_IRQHandler(&hdma_spi2_rx);\n    /* DMA 传输完成后，在中断中将接收到的字节发送到队列 */\n    uint32_t byte = SPI2->DR;  /* 读取 SPI 数据寄存器 */\n    BaseType_t xHigherPriorityTaskWoken = pdFALSE;\n    /* xQueueSendFromISR 是中断安全的 —— 注意 xHigherPriorityTaskWoken 参数 */\n    xQueueSendFromISR(xISRToTaskQ, &byte, &xHigherPriorityTaskWoken);\n    /* 如果 xHigherPriorityTaskWoken 为 pdTRUE，需要在退出中断前触发上下文切换 */\n    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);\n}\n\n/* === 任务 A：持有互斥锁，耗时操作 === */\nvoid low_priority_task(void *pv) {\n    while (1) {\n        if (xSemaphoreTake(xSharedMutex, pdMS_TO_TICKS(100)) == pdPASS) {\n            /* 持有锁期间执行耗时操作 —— 高优先级任务会被阻塞 */\n            HAL_ADC_Start(&hadc1);\n            HAL_ADC_PollForConversion(&hadc1, pdMS_TO_TICKS(10));\n            uint32_t adc_val = HAL_ADC_GetValue(&hadc1);\n            /* 释放锁 —— 如果有高优先级任务在等待，优先级继承会自动撤销 */\n            xSemaphoreGive(xSharedMutex);\n        }\n        vTaskDelay(pdMS_TO_TICKS(500));\n    }\n}",
+      "pitfalls": [],
       "refBook": [
-        "《代码大全》ch17",
-        "《C陷阱与缺陷》ch3"
+        "《代码大全》ch18",
+        "《C陷阱与缺陷》ch4"
       ]
     },
     {
-      "id": "2026-05-05-dma-tips",
-      "title": "DMA 循环缓冲区的 5 个致命陷阱：从数据丢失到总线死锁",
+      "id": "2026-05-05-freertos-queue-tip",
+      "title": "FreeRTOS 任务间通信的 5 个致命陷阱",
       "mode": "tip",
       "language": "C",
       "platform": "通用嵌入式",
-      "toolchain": "GCC",
+      "toolchain": "FreeRTOS",
       "snippetType": "note",
-      "difficulty": "advanced",
-      "tags": ["DMA陷阱", "数据丢失", "总线竞争", "竞态条件", "NVIC"],
-      "explanation": "DMA 相关的 bug 往往不是逻辑错误，而是对总线仲裁和内存一致性的误解。Koenig 在《C陷阱与缺陷》ch4中警告「指针和数组的混淆在硬件交互中会被放大十倍」——在 DMA 场景下，程序员经常忘记 DMA 是绕过 CPU 直接访问总线的，这意味着编译器优化的结果可能和硬件实际看到的不一致。「硬件不会因为你写了注释就乖乖听话。」——《C陷阱与缺陷》第4章",
-      "content": "陷阱一：缓冲区溢出检测缺失。DMA 循环模式下数据不断覆盖旧数据，如果应用层消费速度跟不上 DMA 填充速度，新数据会覆盖还没被读取的旧数据。症状：应用层偶尔收到乱码或断裂的数据包。修复方法：在 ring_buf_available() 中增加溢出计数器——每次 head - tail 的差值超过 BUFFER_SIZE 时说明发生了溢出，记录溢出次数供诊断。\n\n陷阱二：DMA 传输完成中断和 UART 空闲中断的竞态。当 DMA 刚好填满缓冲区（head == tail + BUFFER_SIZE）时触发 TC 中断，同时 UART 收到最后一个字节触发 IDLE 中断。如果两个中断嵌套执行，tail 可能在 TC 中断处理期间被 IDLE 中断的消费代码修改，导致 ring_buf_available() 读到不一致的 head/tail 值。症状：偶发的数据重复读取或跳字节。修复方法：在中断服务函数中关闭全局中断（__disable_irq()），或者使用原子操作 __LDREXB/__STREXB 保护 head/tail 的读写。\n\n陷阱三：SRAM 总线竞争导致 DMA 传输变慢。STM32F4 的 AHB 总线架构下，CPU 和 DMA 共享同一根 AHB 总线访问 SRAM。如果 CPU 在主循环中频繁访问与 DMA 缓冲区相邻的变量（比如 ring_buf.buf 后面的全局变量），DMA 访问会被 CPU 总线事务延迟。症状：高波特率（如 921600bps）下偶尔丢字节，降低波特率后消失。修复方法：将 DMA 缓冲区放在独立的内存段（使用 linker script 的 .dma_buffer section），远离 CPU 热点变量。\n\n陷阱四：DMA 半传输中断（HT）和传输完成中断（TC）的配置错误。STM32 DMA 支持 HT（半传输）和 TC（全传输）两个中断，需要在 DMA_SxCR 寄存器中分别置位 HTIE 和 TCIE 位。如果只开了 TC 中断而缓冲区很大（如 1024 字节），应用层需要等 1024 字节全部填满才能消费一次，延迟高达 88ms @ 115200bps。症状：数据消费延迟大，实时性差。修复方法：同时开启 HT 和 TC 中断，HT 中断处理前 512 字节，TC 中断处理后 512 字节，延迟减半。\n\n陷阱五：循环缓冲区 head/tail 用 uint16_t 而非 uint32_t。当缓冲区运行时间很长（数月）时，uint16_t 会回绕（65535 -> 0），此时 head - tail 的计算会出现负数（无符号整数下溢），ring_buf_available() 返回错误的巨大值。症状：设备运行几天后突然开始疯狂消费数据，读入大量垃圾字节。修复方法：head 和 tail 用 uint32_t，available() 计算时用 (head - tail) 而非 (head & mask - tail & mask)，因为减法天然处理了回绕。\n\n陷阱六：HAL_Delay() 在中断中被调用。有些开发者在 HAL_UART_RxCpltCallback() 中调用 HAL_Delay() 做调试延时，这会阻塞中断执行。在 Cortex-M4 上 HAL_Delay() 基于 SysTick 实现，依赖中断处理——在中断中调用会导致 HardFault。症状：DMA 回调执行后系统复位。修复方法：中断回调中严禁调用任何依赖中断的函数。",
-      "code": "/* 陷阱五演示：uint16_t 回绕问题 */\n\n/* ❌ 错误做法 */\ntypedef struct {\n    uint8_t  buf[256];\n    uint16_t head;              /* 16-bit 会回绕！ */\n    uint16_t tail;              /* 16-bit 会回绕！ */\n} bad_ring_buf_t;\n\nuint16_t bad_available(const bad_ring_buf_t *rb) {\n    /* 当 head=0, tail=65535 时：0 - 65535 = 1 (错误!) */\n    return rb->head - rb->tail;\n}\n\n/* ✅ 正确做法：uint32_t 天然处理回绕 */\ntypedef struct {\n    uint8_t  buf[256];\n    volatile uint32_t head;     /* 32-bit 不易回绕 */\n    volatile uint32_t tail;     /* 32-bit 不易回绕 */\n} good_ring_buf_t;\n\nuint32_t good_available(const good_ring_buf_t *rb) {\n    return rb->head - rb->tail; /* 减法天然处理回绕 */\n}\n\n/* 陷阱三演示：linker script 中的独立 DMA 段 */\n/* .ld 文件中添加：\n * .dma_buffer ALIGN(4) :\n * {\n *   KEEP(*(.dma_buf*))\n * } > RAM AT > ROM\n */\n__attribute__((section(\".dma_buffer\")))\nstatic uint8_t uart2_dma_buf[256];",
+      "difficulty": "intermediate",
+      "tags": ["FreeRTOS", "陷阱", "死锁", "优先级反转", "队列"],
+      "explanation": "Koenig 在《C陷阱与缺陷》第 4 章「库」中警告：「理解标准库的行为边界比记住所有函数签名更重要。」FreeRTOS API 同样如此——理解每个函数的返回值含义、阻塞行为和中断安全边界，比盲目调用 API 重要得多。「理解你使用的每一个库函数在什么情况下会失败。」——《C陷阱与缺陷》第 4 章",
+      "content": "陷阱 1：在中断中调用非 FromISR 版本的队列 API\n触发条件：在 SPI/I2C/DMA 的中断服务程序中直接调用 xQueueSend() 而非 xQueueSendFromISR()。\n表现症状：触发 HardFault（精确数据异常），因为 xQueueSend() 内部可能调用 vTaskSwitchContext() 进行任务调度，而中断上下文中不允许调用调度器。在 Cortex-M 上，这会导致 SCB->CFSR 寄存器的 IMPRECISERR 位被置位。\n快速修复：将所有中断中的队列操作改为 xQueueSendFromISR() 和 xQueueReceiveFromISR()，并正确处理 xHigherPriorityTaskWoken 参数以触发上下文切换。\n\n陷阱 2：队列深度设为 1 时忽略发送超时\n触发条件：xQueueCreate(1, sizeof(msg_t)) 创建了深度为 1 的队列，生产者调用 xQueueSend(q, &msg, portMAX_DELAY) 使用无限超时。\n表现症状：当消费者处理速度慢于生产者时，队列满后生产者永久挂起。如果生产者是高优先级任务，它不会释放 CPU，导致低优先级任务（包括可能负责刷新看门狗的任务）饥饿。系统表现为「假死」——高优先级任务一直在运行但实际什么都没做。\n快速修复：始终给 xQueueSend 设置合理的超时值，如 pdMS_TO_TICKS(10)。如果队列满了，记录统计信息并继续执行其他工作，而不是无限等待。\n\n陷阱 3：用二值信号量实现互斥锁\n触发间条件：使用 xSemaphoreCreateBinary() 创建信号量来保护共享资源，而非 xSemaphoreCreateMutex()。\n表现症状：二值信号量不支持优先级继承。当低优先级任务持有二值信号量、高优先级任务等待它时，中等优先级任务可以抢占低优先级任务，导致优先级反转——这正是 Brooks 在《人月神话》中描述的「计划再计划」现象：你以为用信号量就能解决同步问题，但实际上引入了更隐蔽的死锁风险。\n快速修复：保护共享资源必须使用互斥锁(xSemaphoreCreateMutex())，它支持优先级继承。信号量仅用于同步事件（如中断通知任务）。\n\n陷阱 4：任务通知与队列混用导致状态不一致\n触发条件：同一个任务同时使用队列和任务通知与另一个任务通信。例如，任务 A 通过 xQueueSend 发送命令，又通过 xTaskNotify 发送状态更新。\n表现症状：如果两个通信通道到达顺序不同（队列是 FIFO，通知是原子写入），消费者可能先收到状态更新再收到命令，导致处理顺序错乱。更严重的是，如果通知覆盖了未读取的旧值，消费者会丢失一次状态变更。\n快速修复：为每对任务选择单一的通信机制。点对点轻量通信用任务通知，需要缓冲或多消息用队列。不要混用。\n\n陷阱 5：队列接收超时设为 0 导致忙等待\n触发条件：xQueueReceive(q, &msg, 0) 超时设为 0（非阻塞模式），但在 while(1) 循环中无延迟地调用。\n表现症状：队列为空时，xQueueReceive 立即返回 pdFAIL，循环以 CPU 最大速度迭代，占用 100% CPU 核心。在双核 MCU 上可能导致另一核饥饿，在单核上导致所有其他任务无法运行。表现为系统响应变慢、功耗飙升。\n快速修复：非阻塞接收应配合 vTask Yield() 或 vTaskDelay(1) 使用，或者改用阻塞接收 xQueueReceive(q, &msg, portMAX_DELAY) 让内核在队列为空时自动挂起任务。",
+      "code": "/* === 陷阱演示：错误的非阻塞接收循环 === */\n/* ❌ 错误示范 —— 忙等待，100% CPU */\nvoid bad_consumer_task(void *pv) {\n    msg_t msg;\n    while (1) {\n        if (xQueueReceive(xQueue, &msg, 0) == pdPASS) {\n            process(&msg);\n        }\n        /* 没有 vTaskDelay！这个循环以 MHz 级别运行 */\n    }\n}\n\n/* ✅ 正确做法 1：阻塞接收，队列为空时让出 CPU */\nvoid good_consumer_blocking(void *pv) {\n    msg_t msg;\n    while (1) {\n        if (xQueueReceive(xQueue, &msg, portMAX_DELAY) == pdPASS) {\n            process(&msg);\n        }\n    }\n}\n\n/* ✅ 正确做法 2：非阻塞 + 让步 */\nvoid good_consumer_nonblock(void *pv) {\n    msg_t msg;\n    while (1) {\n        if (xQueueReceive(xQueue, &msg, 0) == pdPASS) {\n            process(&msg);\n        } else {\n            vTaskDelay(pdMS_TO_TICKS(1));  /* 让出 1ms */\n        }\n    }\n}",
       "pitfalls": [
-        "缓冲区溢出无检测：DMA 循环覆盖旧数据 -> 应用层收到乱码 -> 增加溢出计数器监控 head-tail 是否超过 BUFFER_SIZE",
-        "TC 和 IDLE 中断竞态：两个中断同时触发 -> head/tail 不一致 -> 用 __disable_irq() 或原子操作保护临界区",
-        "SRAM 总线竞争：CPU 和 DMA 争抢 AHB 总线 -> 高波特率丢字节 -> DMA 缓冲区放独立 .dma_buffer section",
-        "只开 TC 中断不开 HT：大数据量延迟高达 88ms -> 实时性差 -> 同时启用 HTIE 和 TCIE 中断",
-        "head/tail 用 uint16_t：运行数日后回绕 -> available() 返回巨大错误值 -> 改用 uint32_t",
-        "中断回调中调用 HAL_Delay()：依赖 SysTick 的中断函数在中断中调用 -> HardFault 系统复位 -> 中断中禁止调用任何依赖中断的函数"
+        "陷阱1：在中断中调用 xQueueSend() → HardFault(SCB->CFSR.IMPRECISERR) → 改用 xQueueSendFromISR() 并处理 xHigherPriorityTaskWoken",
+        "陷阱2：深度为 1 的队列 + portMAX_DELAY 超时 → 生产者永久挂起导致系统假死 → 始终设置有限超时如 pdMS_TO_TICKS(10)",
+        "陷阱3：用二值信号量保护共享资源 → 优先级反转（中等优先级任务抢占低优先级持锁任务） → 改用互斥锁 xSemaphoreCreateMutex()",
+        "陷阱4：同一对任务混用队列和通知 → 消息乱序/状态覆盖 → 每对任务只用一种通信机制",
+        "陷阱5：xQueueReceive 超时=0 放在 while(1) 中 → 忙等待占满 100% CPU → 改用 portMAX_DELAY 阻塞或加 vTaskDelay(1)"
       ],
       "refBook": [
         "《C陷阱与缺陷》ch4",
-        "《人月神话》ch9",
-        "《代码大全》ch12"
+        "《人月神话》ch12"
       ]
     },
     {
-      "id": "2026-05-05-dma-refactor",
-      "title": "从轮询到 DMA 循环：UART 接收的重构之路",
+      "id": "2026-05-05-freertos-queue-refactor",
+      "title": "从共享全局变量到消息队列的重构实践",
       "mode": "refactor",
       "language": "C",
-      "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "FreeRTOS",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": ["重构", "DMA", "轮询改中断", "环形缓冲区", "零拷贝"],
-      "explanation": "Fowler 在《重构》中将「数据泥团」和「依恋情结」列为坏味道——当主循环中反复出现相同的 DMA 状态检查和缓冲区拷贝逻辑时，就是典型的数据泥团。McConnell 在《代码大全》ch18中强调「重构的目标不是消除代码，而是消除重复和耦合」。将轮询 UART 改为 DMA 循环接收的重构，本质上是将硬件细节从业务逻辑中剥离出来。「当你发现自己在复制粘贴代码时，停下来——提取一个函数。」——《重构》第2章",
-      "content": "原始代码使用 HAL_UART_Receive() 轮询接收 UART 数据，每次调用都阻塞 CPU 等待数据到达，然后在主循环中手动将接收到的字节拷贝到一个固定大小的数组中做协议解析。这种方式的问题很明显：第一，CPU 被完全占用，无法处理其他任务；第二，每次接收最多 1 字节，115200bps 下每秒要调用 11520 次 HAL_UART_Receive()，函数调用开销占了实际数据传输时间的 30% 以上；第三，协议解析逻辑和硬件接收逻辑耦合在一起，更换波特率或 UART 实例时需要修改解析代码。\n\n重构分三步：第一步，引入环形缓冲区结构体和 ring_buf_init()/ring_buf_read() 接口，将数据暂存从主循环中剥离；第二步，配置 DMA1_Channel5 为循环模式，用 HAL_UART_Receive_DMA() 替代 HAL_UART_Receive()，让 DMA 自动将 UART 数据写入环形缓冲区；第三步，在主循环中用 ring_buf_available() 检查缓冲区是否有数据，有则批量读取后交给协议解析函数。\n\n重构后的代价：代码总量从 80 行增加到 150 行（增加了 DMA 配置和环形缓冲区代码），DMA 缓冲区占用 256 字节 SRAM。但收益显著：CPU 占用率从 95% 降到 15%，数据吞吐能力提升 5 倍，协议解析逻辑完全与硬件解耦。更重要的是，环形缓冲区可以复用到 SPI、ADC_DMAC 等其他 DMA 场景。",
-      "code": "/* ===== 重构前：轮询接收 + 手动拷贝 ===== */\nvoid process_data(uint8_t *data, uint16_t len) {\n    /* 协议解析逻辑 */\n}\n\nint main(void) {\n    HAL_Init();\n    uart_init();\n    uint8_t single_byte;\n    uint8_t packet[128];\n    uint16_t pkt_idx = 0;\n    while (1) {\n        /* 逐字节轮询接收 —— CPU 被完全占用 */\n        HAL_UART_Receive(&huart2, &single_byte, 1, 10);\n        packet[pkt_idx++] = single_byte;  /* 手动拷贝 */\n        if (pkt_idx >= 128 || single_byte == 0xFF) {\n            process_data(packet, pkt_idx);  /* 耦合严重 */\n            pkt_idx = 0;\n        }\n    }\n}\n\n/* ===== 重构后：DMA 循环 + 环形缓冲区 ===== */\n\n/* step 1: 环形缓冲区接口 */\nuint16_t ring_buf_available(const dma_ring_buf_t *rb);\nint      ring_buf_read(dma_ring_buf_t *rb, uint8_t *out,\n                       uint16_t max_len);\n\n/* step 2: DMA 在 uart2_dma_begin() 中自动填充缓冲区 */\n/* step 3: 主循环只关心消费 */\nint main(void) {\n    HAL_Init();\n    uart2_dma_begin();               /* DMA 循环接收已启动 */\n    uint8_t packet[128];\n    while (1) {\n        uint16_t avail = ring_buf_available(&uart2_rx_buf);\n        if (avail > 0) {\n            uint16_t len = (avail < 128) ? avail : 128;\n            ring_buf_read(&uart2_rx_buf, packet, len);\n            process_data(packet, len); /* 纯业务逻辑 */\n        }\n        /* CPU 空闲时可做其他事 */\n        low_power_idle();\n    }\n}",
-      "pitfalls": [
-        "DMA 缓冲区大小和协议帧最大长度不匹配——缓冲区 256 字节但协议帧最大 512 字节，导致半帧数据被 DMA 覆盖。修复：缓冲区至少为 MAX_FRAME_SIZE * 2",
-        "ring_buf_read() 返回的 len 和 process_data() 期望的帧长度不一致——环形缓冲区是字节流，不包含帧边界信息。修复：在协议层增加帧定界符（如 0xFF）或长度字段来分割帧",
-        "重构后忘了在 uart2_dma_begin() 之后调用 HAL_UART_Receive_DMA()——DMA 没有启动，缓冲区永远是空的。HAL_UART_Receive_DMA() 内部会配置 DMA_SxPAR/M0AR/NDTR 寄存器并启动传输，漏掉这步整个 DMA 机制不工作"
-      ],
+      "tags": ["FreeRTOS", "重构", "共享变量", "消息队列", "解耦"],
+      "explanation": "Fowler 在《重构》第 2 章「原则」中指出：「坏味道『数据泥团』表现为多个函数共享一组相关变量——这通常意味着应该将它们封装为一个独立的数据结构。」在嵌入式系统中，这进一步演变为「全局变量泥团」——多个任务通过全局变量交换数据，导致难以追踪的数据竞争和时序依赖。「任何足够复杂的系统，其数据共享方式必然趋于混乱，除非有人主动重构。」——《重构》第 2 章",
+      "content": "下面展示一个典型的嵌入式系统中从共享全局变量到消息队列的重构过程。\n\n改进前的代码存在三个坏味道：(1) 数据泥团——motor_state、target_speed、current_rpm 三个全局变量在三个任务中被读写；(2) 广义赋值——多个任务直接修改全局变量，没有任何同步机制；(3) 隐式依赖——control_task 依赖 motor_state 的变化来触发 PID 计算，但这种依赖是隐式的（通过轮询全局变量），导致控制周期不稳定。\n\n重构后的代码消除了所有全局可变状态。motor_task 将传感器读数封装为 msg_t 消息发送到 queue，control_task 从 queue 接收消息后执行 PID 计算，再将控制指令发送到 command_queue。每个任务的输入输出都通过队列显式声明，依赖关系一目了然。\n\n代价分析：重构后增加了约 48 字节的 RAM 开销（两个深度为 4 的队列，每个元素 8 字节 + 队列控制块）；控制延迟从原来的固定 10ms 变为可变（取决于队列深度和生产速率），在极端情况下可能增加 1-2 个 tick 的延迟；代码行数从 80 行增加到 120 行，但可测试性显著提升——现在可以单独测试 control_task 而不需要模拟硬件。",
+      "code": "/* === 重构前：共享全局变量（坏味道：数据泥团 + 广义赋值）=== */\ntypedef struct {\n    int16_t target_speed;\n    int16_t current_rpm;\n    uint8_t  state;       /* 0=stop, 1=running, 2=error */\n} motor_state_t;\n\nstatic motor_state_t motor_state;  /* 全局可变状态 */\n\nvoid sensor_task(void *pv) {\n    while (1) {\n        motor_state.current_rpm = HAL_TIM_ReadCounter(&htim4);  /* 读编码器 */\n        motor_state.state = (motor_state.current_rpm > 100) ? 1 : 0;\n        vTaskDelay(pdMS_TO_TICKS(10));\n    }\n}\n\nvoid control_task(void *pv) {\n    while (1) {\n        int16_t error = motor_state.target_speed - motor_state.current_rpm;\n        int16_t pwm = pid_compute(error);  /* PID 计算 */\n        __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm);\n        vTaskDelay(pdMS_TO_TICKS(10));  /* 隐式依赖 sensor_task 的 10ms 周期 */\n    }\n}\n\n/* === 重构后：基于消息队列的显式通信 === */\ntypedef enum { MSG_UPDATE_RPM, MSG_SET_SPEED } msg_type_t;\ntypedef struct {\n    msg_type_t type;\n    int16_t    value;  /* RPM 或目标速度 */\n} motor_msg_t;\n\nstatic QueueHandle_t xSensorQueue;\nstatic QueueHandle_t xCommandQueue;\n\nvoid comms_init(void) {\n    xSensorQueue  = xQueueCreate(4, sizeof(motor_msg_t));\n    xCommandQueue = xQueueCreate(4, sizeof(motor_msg_t));\n}\n\nvoid sensor_task(void *pv) {\n    motor_msg_t msg = { .type = MSG_UPDATE_RPM };\n    while (1) {\n        msg.value = HAL_TIM_ReadCounter(&htim4);\n        xQueueSend(xSensorQueue, &msg, pdMS_TO_TICKS(10));\n        vTaskDelay(pdMS_TO_TICKS(10));\n    }\n}\n\nvoid control_task(void *pv) {\n    motor_msg_t msg;\n    int16_t target = 0;\n    while (1) {\n        xQueueReceive(xSensorQueue, &msg, portMAX_DELAY);\n        if (msg.type == MSG_UPDATE_RPM) {\n            int16_t error = target - msg.value;\n            int16_t pwm = pid_compute(error);\n            __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, pwm);\n        }\n        /* 接收来自上层的速度设定命令 */\n        if (xQueueReceive(xCommandQueue, &msg, pdMS_TO_TICKS(100)) == pdPASS) {\n            if (msg.type == MSG_SET_SPEED) target = msg.value;\n        }\n    }\n}",
+      "pitfalls": [],
       "refBook": [
         "《重构》ch2",
-        "《代码大全》ch18",
-        "《UNIX编程艺术》ch4"
+        "《UNIX编程艺术》ch3"
       ]
     }
   ]
