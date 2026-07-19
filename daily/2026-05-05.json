@@ -1,109 +1,109 @@
 {
   "date": "2026-05-05",
-  "topic": "状态机的枚举 + switch 实现",
+  "topic": "DMA + 循环缓冲区的正确姿势",
   "items": [
     {
-      "id": "2026-05-05-state-machine-architecture",
-      "title": "枚举 + switch 状态机：为什么它统治了嵌入式世界二十年",
-      "topic": "状态机",
+      "id": "2026-05-05-dma-circular-architecture",
+      "title": "DMA 循环缓冲区架构：零拷贝数据通道的边界设计",
+      "topic": "DMA 循环缓冲区",
       "mode": "architecture",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "GCC",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
       "snippetType": "pattern",
-      "difficulty": "beginner",
-      "tags": ["状态机", "枚举", "switch", "架构模式", "可维护性"],
-      "explanation": "《UNIX编程艺术》中 Eric Raymond 总结的模块原则第一条就是\\\"Separation of Concerns\\\"——关注点分离。枚举 + switch 状态机正是这一原则在行为建模层面的体现：状态是状态，事件是事件，转移逻辑是转移逻辑，三者互不缠绕。「每一个优秀程序的背后，都有一条清晰的分界线。」——《UNIX编程艺术》第 2.3 节",
-      "content": "在嵌入式系统中，状态机是最常用的行为建模工具之一。枚举 + switch 的实现方式之所以能统治嵌入式领域二十年，核心原因在于它完美契合了 C 语言的表达能力和嵌入式开发对确定性的追求。\n\n从《C语言接口与实现》的角度看，枚举定义了一个封闭的类型域（closed type domain），编译器可以检查 switch 是否覆盖了所有 case——这是 ADT（抽象数据类型）思想的直接应用。你把状态定义为一个 enum，转移逻辑封装在一个函数里，对外暴露的状态操作只有 init()、event() 和 get_state() 三个接口。调用者不需要知道内部状态数量、不需要关心状态转移的条件，这就是信息隐藏。\n\n具体到嵌入式场景，一个典型的通信协议解析器会经历以下状态：IDLE → SYNC → ADDR → CMD → DATA → CRC_CHECK → ACK/NACK → IDLE。每个状态对应 switch 中的一个 case，事件通过参数传入。这种结构的好处是：你可以一眼看到完整的状态转移图——把代码展开就是状态机图本身。对于调试来说，这比用函数指针数组或 goto 实现的版本直观十倍。\n\n优点方面：第一，确定性——switch 是 O(1) 跳转，没有间接寻址开销，在 Cortex-M0 上执行一个状态转移通常只需 2-4 个时钟周期；第二，可验证性——编译器可以对未覆盖的 enum 值发出警告（-Wswitch-enum），这在添加新状态时非常有用；第三，可测试性——每个 case 是一个独立的代码块，可以用单元测试单独验证特定状态的转移逻辑。\n\n但《人月神话》提醒我们\\\"没有银弹\\\"。枚举 + switch 状态机也有代价：当状态数量超过 10 个、每个状态有超过 3 种事件时，switch 会变得极其臃肿。一个 500 行的 handle_event() 函数就是噩梦。此时你需要考虑更高级的模式——比如状态表（state table）驱动，或者用函数指针数组替代 switch。另一个代价是扩展性差——如果要添加子状态（比如 DATA 状态下分 DATA_WAIT、DATA_RECEIVE、DATA_COMPLETE），switch 结构需要嵌套，嵌套深度一旦超过两层，可读性急剧下降。\n\n还有一个常被忽视的问题：状态机的初始化和清理。很多工程师只写了 run() 函数，却忘了在 init() 中把所有状态相关的资源清零，在 exit() 中释放临时缓冲区。结果就是状态机复用时残留了上一次的事件数据。《C陷阱与缺陷》中提到的未初始化变量问题，在状态机里尤为常见——因为状态变量和事件变量经常分散在不同文件中。",
-      "code": "/* 状态机架构定义 —— 接口层（信息隐藏） */\n\ntypedef enum {\n    STATE_IDLE = 0,\n    STATE_SYNC,\n    STATE_ADDR,\n    STATE_CMD,\n    STATE_DATA,\n    STATE_CRC_CHECK,\n    STATE_ACK,\n    STATE_NACK,\n    STATE_COUNT /* 用于编译器 -Wswitch-enum 检查 */\n} protocol_state_t;\n\ntypedef enum {\n    EVT_FRAME_START = 0,\n    EVT_BYTE_RECEIVED,\n    EVT_CRC_PASS,\n    EVT_CRC_FAIL,\n    EVT_TIMEOUT,\n    EVT_RESET\n} protocol_event_t;\n\n/* 对外接口 —— 调用者只看到这三个函数 */\nvoid protocol_init(void);\nvoid protocol_event(protocol_event_t evt);\nprotocol_state_t protocol_get_state(void);\n\n/* 内部实现 —— 调用者不可见 */\nstatic protocol_state_t current_state = STATE_IDLE;\nstatic uint8_t frame_buffer[256];\nstatic uint16_t buffer_idx = 0;",
+      "difficulty": "intermediate",
+      "tags": ["DMA", "循环缓冲区", "零拷贝", "UART", "架构设计"],
+      "explanation": "《C语言接口与实现》中 David Schmidt 提出 ADT 的核心原则是「接口定义行为，实现隐藏细节」——DMA 循环缓冲区正是这一思想的硬件级体现。数据如何从 UART_DR 搬运到 RAM、由谁触发中断、缓冲区如何卷绕，这些实现细节对上层完全隐藏；上层只看到 read_ptr / write_ptr / available() 三个操作。「每个抽象都应该有明确的边界，边界两侧的人不需要理解对方的内部运作。」——《UNIX编程艺术》第 2.3 节",
+      "content": "DMA 循环缓冲区（Circular Buffer）是嵌入式系统中实现零拷贝数据通道的核心模式。它的架构可以分为三层：硬件层、驱动层、应用层。\n\n硬件层：DMA 控制器配置为循环模式（CIRCULAR），当传输计数寄存器（NDTR）减到 0 时自动重装载为缓冲区大小，无限循环。以 STM32F4 的 USART1 + DMA2 Stream5 Channel 4 为例，DMA 将 USART1->DR 的数据持续搬运到 uint8_t rx_buffer[512]。每次 DMA 完成一半传输（Half Transfer）或完整传输（Transfer Complete）时触发中断。\n\n驱动层：这是最关键的一层。环形缓冲区需要维护两个指针：write_ptr（DMA 写入位置，由硬件自动推进）和 read_ptr（CPU 读取位置）。核心不变量是：available = (write_ptr - read_ptr + BUFFER_SIZE) % BUFFER_SIZE。驱动层对外暴露三个函数：dma_ring_init()、dma_ring_read()、dma_ring_available()。调用者永远不应该直接访问 write_ptr —— 它是 DMA 硬件的唯一真相源。\n\n应用层：应用代码只关心「有多少可用数据」和「读出来」。它不关心 DMA 何时触发、缓冲区何时卷绕、中断优先级如何设置。\n\n这种分层带来的最大好处是：你可以在不修改应用层代码的情况下更换硬件平台（比如从 USART1+DMA2 换到 USART3+DMA1），只要驱动层的接口不变。\n\n但《人月神话》提醒我们「没有银弹」。循环缓冲区的代价是复杂度转移——你并没有消除并发问题，只是把它从实时数据通路移到了指针管理上。当 CPU 读取速度和 DMA 写入速度不匹配时，会出现覆盖旧数据的问题。解决策略有三种：1) 应用层消费速度快于生产速度（大多数传感器场景满足）；2) 缓冲区溢出时丢弃最旧数据（适合遥测）；3) 缓冲区溢出时通知上层（适合关键协议）。\n\n另一个常被忽视的代价是缓存一致性。在 Cortex-M7 上，DMA 写入的内存位于 DTCM 或 AXI SRAM 时不需要额外处理；但如果缓冲区在普通 AHB SRAM，CPU 可能在 DMA 写入之前读到缓存中的旧数据。解决方案是在初始化时将缓冲区放入无缓存区域，或在读取前调用 __DMB() 内存屏障。\n\n最后，中断优先级的设计遵循一个原则：DMA 中断优先级应高于产生数据的 peripherals 中断，但低于安全相关中断。例如 USART1_RXNE_IRQn 优先级设为 7，DMA2_Stream5_IRQn 优先级设为 5，WWDG 优先级设为 0。这样 DMA 能在 UART FIFO 溢出前把数据搬走。",
+      "code": "/* DMA 环形缓冲区架构定义 */\n#define DMA_RING_BUF_SIZE  512u\n#define DMA_HALF_THRESHOLD (DMA_RING_BUF_SIZE / 2)\n\ntypedef struct {\n    volatile uint16_t write_ptr;  /* DMA 硬件维护，CPU 只读 */\n    uint16_t            read_ptr;  /* CPU 维护 */\n    uint8_t             buffer[DMA_RING_BUF_SIZE];\n    volatile uint32_t   half_flag; /* DMA Half Transfer 标志 */\n    volatile uint32_t   complete_flag; /* DMA Transfer Complete 标志 */\n} dma_ring_buf_t;\n\n/* 接口：调用者只看到这三个函数 */\nvoid dma_ring_init(dma_ring_buf_t *ring);\nuint16_t dma_ring_available(const dma_ring_buf_t *ring);\nuint8_t dma_ring_read(dma_ring_buf_t *ring);\nconst uint8_t* dma_ring_peek(const dma_ring_buf_t *ring, uint16_t *len);\n\n/* 内部：从 NDTR 寄存器反推 write_ptr */\nstatic inline uint16_t dma_get_write_ptr(DMA_Stream_TypeDef *stream) {\n    return DMA_RING_BUF_SIZE - (uint16_t)__HAL_DMA_GET_COUNTER(stream);\n}",
       "pitfalls": [
-        "陷阱1：switch 未覆盖所有 enum 值 → 症状：添加新状态后编译器不报错，运行时进入未定义状态 → 修复：编译时加 -Wswitch-enum 标志，并在 enum 末尾加 COUNT 哨兵值",
-        "陷阱2：状态变量未初始化 → 症状：上电后 current_state 可能是任意值（栈上的垃圾数据），导致第一个事件被错误处理 → 修复：在文件作用域声明时显式赋初值 STATE_IDLE，或在 init() 中强制设置",
-        "陷阱3：跨状态的全局缓冲区未清理 → 症状：状态从 DATA 回到 IDLE 后，frame_buffer 残留上一帧数据，下一帧校验通过但内容是旧的 → 修复：每次状态转移到 IDLE 时调用 memset(frame_buffer, 0, sizeof(frame_buffer)) 或使用 buffer_idx == 0 作为有效数据标记"
+        "陷阱1：CPU 读 write_ptr 时 DMA 正在更新 → 症状：读到不一致的中间值导致 available 计算错误 → 修复：在 Cortex-M3/M4 上 uint16_t 读写是原子的（对齐访问），但为安全起见使用 volatile 修饰并加 __DMB() 屏障",
+        "陷阱2：缓冲区太小导致数据覆盖 → 症状：应用层偶尔丢字节，协议解析 CRC 失败 → 修复：缓冲区大小至少 = 最大生产间隔 × 最高生产速率 × 1.5，STM32 UART 场景下 256 字节起步",
+        "陷阱3：DMA 中断优先级低于 UART RXNE → 症状：DMA 来不及搬运数据，UART DR 被覆盖，丢失字节 → 修复：DMA 中断优先级数字更小（更高优先级），如 DMA 设 5，UART RXNE 设 7"
       ],
       "refBook": [
-        "《UNIX编程艺术》ch2.3 模块原则",
-        "《C语言接口与实现》ch2 抽象数据类型",
-        "《人月神话》第12章 没有银弹",
-        "《C陷阱与缺陷》ch1 预处理器"
+        "《C语言接口与实现》ch2 — 抽象数据类型与信息隐藏",
+        "《UNIX编程艺术》ch2.3 — 模块原则：清晰的边界",
+        "《人月神话》ch12 — 没有银弹：复杂度守恒"
       ]
     },
     {
-      "id": "2026-05-05-state-machine-snippet",
-      "title": "枚举状态机的核心循环：handle_event() 的写法",
-      "topic": "状态机",
+      "id": "2026-05-05-dma-ring-snippet",
+      "title": "USART1 + DMA2 循环接收完整模板：从初始化到半传输回调",
+      "topic": "DMA 循环缓冲区",
       "mode": "snippet",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "GCC",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["状态机", "switch", "事件处理", "枚举", "可验证性"],
-      "explanation": "《代码大全》中强调\\\"每个函数只做一件事\\\"——在状态机中，这意味着每个 case 只做当前状态的逻辑，并通过赋值改变 current_state 来触发转移。「好的代码像好的建筑：结构清晰，每一层都有其存在的理由。」——《代码大全》第 15 章",
-      "content": "这段代码展示了枚举 + switch 状态机的核心实现：一个 handle_event() 函数，接收事件参数并根据当前状态做出反应。关键设计点：1) 使用 static volatile 确保 current_state 在中断和主循环之间安全共享；2) 每个 case 末尾必须有 break 或 return，防止 fall-through（除非故意利用 C 的 fall-through 特性合并多个状态）；3) 状态转移通过赋值实现，而不是 goto 或函数调用——这样编译器能优化出最优的跳转指令；4) 默认 case 处理未知事件，记录错误但不崩溃。注意：这里的事件处理是非阻塞的，适合放在主循环中定期调用。如果需要中断驱动的事件，需要在中断中设置事件标志位，主循环轮询该标志并调用 handle_event()。",
-      "code": "static volatile protocol_state_t current_state = STATE_IDLE;\nstatic uint8_t  event_received = 0;  /* 中断设置，主循环读取 */\nstatic protocol_event_t last_event;\n\n/* 中断：收到 UART 字节时设置事件标志 */\nvoid USART1_IRQHandler(void) {\n    if (USART1->SR & USART_SR_RXNE) {\n        last_event = EVT_BYTE_RECEIVED;\n        event_received = 1;\n        USART1->SR &= ~USART_SR_RXNE;  /* 清除标志 */\n    }\n}\n\n/* 主循环：非阻塞事件处理 */\nvoid handle_event(void) {\n    if (!event_received) return;\n    event_received = 0;\n\n    switch (current_state) {\n    case STATE_IDLE:\n        if (last_event == EVT_FRAME_START) {\n            buffer_idx = 0;\n            current_state = STATE_SYNC;\n        }\n        break;\n\n    case STATE_SYNC:\n        if (last_event == EVT_BYTE_RECEIVED) {\n            frame_buffer[buffer_idx++] = USART1->DR;\n            if (buffer_idx >= 3 && frame_buffer[0] == 0xAA && frame_buffer[1] == 0x55) {\n                current_state = STATE_ADDR;\n            } else if (buffer_idx >= 4) {\n                buffer_idx = 0;\n            }\n        }\n        break;\n\n    case STATE_ADDR:\n    case STATE_CMD:\n        if (last_event == EVT_BYTE_RECEIVED) {\n            frame_buffer[buffer_idx++] = USART1->DR;\n            current_state = (current_state == STATE_ADDR) ? STATE_CMD : STATE_DATA;\n        }\n        break;\n\n    default:\n        /* 未知状态：重置到 IDLE，避免死锁 */\n        current_state = STATE_IDLE;\n        buffer_idx = 0;\n        break;\n    }\n}",
+      "tags": ["DMA", "UART", "HAL", "STM32F4", "循环接收", "回调"],
+      "explanation": "《代码大全》Steve McConnell 在 ch12「防御性编程」中强调：「对于可能失败的外部交互，永远不要假设一次成功。」DMA 初始化就是典型场景——时钟未使能、DMA 通道冲突、中断向量表偏移错误都可能导致静默失败。注释中标注了每一步的硬件动作和常见失败点。「先保证能跑起来，再优化速度。」——《代码大全》第 12 章",
+      "content": "下面是 STM32F407 上使用 HAL 库配置 USART1 + DMA2 Stream5 Channel 4 进行循环接收的完整模板。目标波特率 115200 8N1，缓冲区 512 字节。关键点：1) DMA 必须配置为循环模式（DMA_CIRCULAR）；2) 接收数据宽度必须与 UART 数据宽度一致（Byte）；3) 外设地址固定为 &huart1.Instance->DR，内存地址为 ring->buffer；4) 半传输回调（HAL_UARTEx_RxEventCallback）用于通知应用层有前半块新数据；5) 传输完成回调用于处理尾部的零散数据。中断优先级：DMA2_Stream5_IRQn 设为 5（高于 UART 的 7），确保 DMA 优先搬运。",
+      "code": "/* USART1 + DMA2 Stream5 Channel 4 循环接收模板\n * STM32F407 @ 168MHz, APB2 = 84MHz, 115200-8N1\n * 缓冲区: 512 bytes, DMA CIRCULAR mode\n */\n#include \"stm32f4xx_hal.h\"\n\nextern UART_HandleTypeDef huart1;\nextern DMA_HandleTypeDef hdma_usart1_rx;\n\nstatic dma_ring_buf_t uart1_ring;\n\nvoid Uart1_DmaRing_Init(void) {\n    dma_ring_init(&uart1_ring);\n\n    /* 启动 DMA 循环接收：\n     * 外设=&huart1.Instance->DR(0x40011004)\n     * 内存=uart1_ring.buffer[0]\n     * 长度=512, 循环模式\n     */\n    HAL_UARTEx_ReceiveToIdle_DMA(\n        &huart1,\n        uart1_ring.buffer,\n        DMA_RING_BUF_SIZE);\n}\n\n/* DMA 传输一半时调用：前半块缓冲区有新数据 */\nvoid HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,\n                                 uint16_t Size) {\n    if (huart->Instance == USART1) {\n        uart1_ring.half_flag = 1;\n        /* 此时 DMA 正在填充后半块，前半块可安全读取 */\n    }\n}\n\n/* DMA 传输完成时调用：处理尾部数据 */\nvoid HAL_UART_IRQHandler(UART_HandleTypeDef *huart) {\n    if (huart->Instance == USART1) {\n        uart1_ring.complete_flag = 1;\n    }\n}\n\nuint16_t dma_ring_available(const dma_ring_buf_t *ring) {\n    uint16_t w = ring->write_ptr;\n    uint16_t r = ring->read_ptr;\n    return (w - r + DMA_RING_BUF_SIZE) & (DMA_RING_BUF_SIZE - 1);\n}\n\nuint8_t dma_ring_read(dma_ring_buf_t *ring) {\n    if (dma_ring_available(ring) == 0) return 0;\n    uint8_t byte = ring->buffer[ring->read_ptr];\n    ring->read_ptr = (ring->read_ptr + 1) & (DMA_RING_BUF_SIZE - 1);\n    return byte;\n}",
       "pitfalls": [
-        "陷阱1：switch case 遗漏 break → 症状：STATE_SYNC 处理完后 fall-through 到 STATE_ADDR，导致地址字节被当成命令字节处理 → 修复：每个 case 末尾必须显式写 break，即使逻辑上不需要",
-        "陷阱2：event_received 未声明为 volatile → 症状：编译器优化后主循环永远读不到中断设置的标志值，事件永不处理 → 修复：event_received 必须在声明时加 volatile，或者使用 __atomic_store_n() / __DMB() 内存屏障",
-        "陷阱3：中断中直接读取 USART1->DR 但主循环也读 → 症状：中断已经读了 DR 清空 FIFO，主循环再读 USART1->DR 得到的是旧数据或 0xFF → 修复：中断中只设置标志位和事件类型，数据读取统一在主循环的 handle_event() 中完成"
+        "陷阱1：HAL_UARTEx_ReceiveToIdle_DMA 的长度参数必须是缓冲区实际大小而非剩余空间 → 症状：第一次调用后 DMA 只传输指定长度就停止，不再循环 → 修复：始终传入 DMA_RING_BUF_SIZE（512），不要传 dma_ring_available() 的结果",
+        "陷阱2：DMA 中断优先级设置错误 → 症状：UART 收到数据但 DR 被下一个字节覆盖，DMA 还没搬运 → 修复：NVIC_SetPriority(DMA2_Stream5_IRQn, 5); NVIC_EnableIRQ(DMA2_Stream5_IRQn); 确保优先级数字小于 UART1_IRQn(7)",
+        "陷阱3：RxEventCallback 的 Size 参数不是实际接收字节数 → 症状：应用层用 Size 作为有效数据长度处理，读到垃圾数据 → 修复：Size 只是触发回调的阈值（到 Idle 检测到的最小量），实际可用数据必须通过 dma_ring_available() 计算"
       ],
       "refBook": [
-        "《代码大全》ch15 防御性编程",
-        "《C陷阱与缺陷》ch2 类型和声明",
-        "《UNIX编程艺术》ch5 设计哲学"
+        "《代码大全》ch12 — 防御性编程：外部交互不假设成功",
+        "《C陷阱与缺陷》ch3 — 库函数参数的隐含契约",
+        "《UNIX编程艺术》ch5 — 设计原则：可靠性"
       ]
     },
     {
-      "id": "2026-05-05-state-machine-pitfalls",
-      "title": "状态机实现中的五个经典陷阱",
-      "topic": "状态机",
+      "id": "2026-05-05-dma-pitfalls",
+      "title": "DMA 循环缓冲区的七个真实踩坑点：从缓存一致性到缓冲区竞态",
+      "topic": "DMA 循环缓冲区",
       "mode": "tip",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "GCC",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
       "snippetType": "note",
-      "difficulty": "intermediate",
-      "tags": ["状态机", "陷阱", "枚举", "switch", "调试"],
-      "explanation": "《人月神话》中说\\\"向延后的项目追加人力只会让它更加延后\\\"——状态机的 bug 也是如此：越到后期修复成本越高。早期预防胜于后期 debug。「每一个 bug 都是设计疏漏的体现，而非实现失误。」——《人月神话》第 8 章",
-      "content": "枚举 + switch 状态机虽然结构简单，但在实际项目中至少有五个经典陷阱会让开发者反复踩坑。这些不是理论问题，而是我在现场调试中亲眼见过的真实故障。\n\n第一个陷阱是\\\"幽灵状态\\\"——current_state 的值变成了 enum 中不存在的值。原因通常是内存越界写覆盖了状态变量，或者使用了未初始化的局部变量。症状是 switch 的 default case 频繁触发，系统反复复位到 IDLE。修复方法：用静态分析工具（如 cppcheck）检测数组越界，将 current_state 放在单独的段中并用 watchdog 监控其变化频率。\n\n第二个陷阱是\\\"事件丢失\\\"——在中断和主循环之间传递事件时，如果事件发生得太快，后一个事件会覆盖前一个。比如在 STATE_DATA 状态下连续收到两个 EVT_BYTE_RECEIVED，第二个会把第一个覆盖掉。症状是协议解析偶尔丢字节，CRC 校验失败率异常高。修复方法：使用环形事件队列（大小为 4 或 8），而不是单个 event 变量。\n\n第三个陷阱最隐蔽：\\\"状态转移竞态\\\"——如果在 handle_event() 执行过程中（尚未更新 current_state）又来了一个新事件，handle_event() 会在旧状态下处理新事件。症状是系统在高负载下行为不一致，有时正常有时异常。修复方法：在处理事件前禁用中断（__disable_irq()），处理完再恢复，或者使用原子操作。\n\n第四个陷阱是\\\"状态爆炸\\\"——当需要区分\\\"在 DATA 状态下正在收长度字段\\\"和\\\"在 DATA 状态下正在收数据体\\\"时，有人选择新增 STATE_DATA_LEN 和 STATE_DATA_BODY 两个状态。如果这种情况频繁出现，状态数量会指数级增长。症状是 switch 函数超过 500 行，维护成本极高。修复方法：引入\\\"子状态\\\"概念，用一个额外的 sub_state 变量，或者改用状态表驱动。\n\n第五个陷阱是\\\"超时处理缺失\\\"——协议解析中如果没有超时机制，系统在收到不完整帧时会永远卡在某个中间状态。症状是设备接入后偶尔死锁，必须重启才能恢复。修复方法：在每个状态中设置超时计数器，超时后自动跳转到 IDLE 或 ERROR 状态。",
-      "code": "/* 改进方案：带超时和事件队列的状态机框架 */\n\ntypedef struct {\n    protocol_event_t events[8];  /* 环形事件队列，容量 8 */\n    volatile uint16_t head;      /* 写入位置 */\n    volatile uint16_t tail;      /* 读取位置 */\n    volatile uint32_t tick;      /* 当前系统 Tick */\n} event_queue_t;\n\nstatic event_queue_t eq;\n\n/* 入队：线程/中断安全 */\nvoid eq_push(protocol_event_t evt) {\n    uint16_t next = (eq.head + 1) % 8;\n    if (next != eq.tail) {  /* 队列未满 */\n        eq.events[eq.head] = evt;\n        eq.head = next;\n    }\n    /* 队列满时静默丢弃——比丢失事件好 */\n}\n\n/* 出队：返回最新事件，NULL 表示空 */\nprotocol_event_t *eq_pop(void) {\n    if (eq.head == eq.tail) return NULL;\n    static protocol_event_t result;\n    result = eq.events[eq.tail];\n    eq.tail = (eq.tail + 1) % 8;\n    return &result;\n}\n\n/* 超时检查：在每个 case 中调用 */\nstatic int check_timeout(uint32_t enter_tick, uint32_t max_ms) {\n    return (get_tick_count() - enter_tick) > max_ms;\n}",
+      "difficulty": "advanced",
+      "tags": ["DMA", "缓存一致性", "竞态", "STM32F7", "调试"],
+      "explanation": "《人月神话》Brooks 在 ch3「计划再计划」中指出：「开发者总是系统性低估任务的复杂度。」DMA 循环缓冲区看起来只是「开 DMA、挂缓冲区、写回调」三件事，但真实项目中至少有七个隐蔽的坑等待跳入。每一个都可能在量产半年后才暴露。「调试是科学方法在工程中最纯粹的应用。」——《C陷阱与缺陷》前言",
+      "content": "以下是 DMA 循环缓冲区在实际项目中踩过的七个坑，按严重程度排序。\n\n坑1：缓存一致性（Cortex-M7 专属）\nSTM32F765 有 1MB AXI SRAM，默认启用了 L1 Cache。DMA 直接写内存绕过 Cache，CPU 读同一地址时可能拿到 Cache 中的旧数据。现象：示波器看到 UART 数据正确，但应用层解析偶尔出错，且与 CPU 负载相关（负载高时 Cache 命中率变化）。\n\n修复：方案A，将环形缓冲区放在 D2 SRAM 的无缓存区域（0x30000000 起始的 64KB）；方案B，在读取前加 __DSB(); __ISB(); 强制刷新的开销太大不推荐；方案C，初始化时调用 SCB_CleanDCache_by_Addr() 清理缓冲区对应 cache line。\n\n坑2：write_ptr 的非原子读取（Cortex-M0/M3）\nCortex-M0 的 16 位非对齐访问不是原子的。如果 write_ptr 恰好跨字边界，CPU 可能需要两次总线事务才能读完。DMA 硬件在同一时刻更新了 NDTR，你就读到了旧的高 16 位 + 新的低 16 位。\n\n修复：确保 write_ptr 在 RAM 中 2 字节对齐（struct 天然对齐），或使用 __atomic_load_n(&ring->write_ptr, __ATOMIC_RELAXED)。\n\n坑3：HAL 回调中的阻塞操作\n在 HAL_UARTEx_RxEventCallback 中调用 printf、vTaskDelay、或任何可能阻塞的函数。现象：DMA 中断被长时间占用，后续数据丢失，系统看门狗复位。\n\n修复：回调中只做标志置位和轻量级操作（< 10 微秒），实际数据处理放到主循环或 RTOS 任务中。\n\n坑4：缓冲区大小不是 2 的幂\n取模运算 (w - r + SIZE) % SIZE 在 SIZE 不是 2 的幂时会变成除法指令，在 M0 上消耗 20+ 个时钟周期。更严重的是，如果你用位掩码 (w - r + SIZE) & (SIZE - 1) 优化但 SIZE 不是 2 的幂，结果完全错误。\n\n修复：始终使用 2 的幂作为缓冲区大小（256、512、1024），并在编译期断言：_Static_assert((DMA_RING_BUF_SIZE & (DMA_RING_BUF_SIZE - 1)) == 0, \"Buffer size must be power of 2\");\n\n坑5：DMA 通道被其他外设抢占\nSTM32F4 的 DMA2 Stream5 Channel 4 也被 SDIO 使用。如果你在同一个项目里同时启用 SDIO 和 USART1 DMA，两者会争夺同一个 Stream+Channel 组合。\n\n修复：查参考手册 RM0090 的 DMA 请求映射表。USART1 RX 在 DMA2 Stream2 Channel 4，不是 Stream5。Stream5 Channel 4 是 SDIO。选错 Stream 会导致数据传到错误的外设或完全静默失败。\n\n坑6：Idle Line Detection 的超时设置\nHAL_UARTEx_ReceiveToIdle_DMA 依赖 UART 的 Idle 线检测。如果两帧之间的间隔超过 RTOR 寄存器设定的超时（默认 1 个字符时间），DMA 不会触发 RxEventCallback。在 115200 波特率下，一个字符约 87µs，但实际建议设置 RTOR = 3 个字符时间 = 260µs。\n\n修复：huart1.Instance->RTOR = 0x000003; 或在 CubeMX 中设置 Receive Timeout Value 为 3。\n\n坑7：多缓冲区切换时的数据撕裂\n当你用两个缓冲区交替处理（ping-pong buffer）时，如果在 HalfTransfer 回调中开始处理前半块，但同时应用层也在读取同一个缓冲区，就会出现读写竞态。\n\n修复：ping-pong 模式下，HalfTransfer 回调标记前半块「只读」，应用层处理完后才允许 DMA 覆盖；或使用单缓冲区 + available 计数的方式（更简单，推荐）。",
+      "code": "/* 缓存一致性检查 + 编译期断言 */\n\n/* 将缓冲区放在无缓存区域（STM32F7 D2 SRAM, 0x30000000）*/\n__attribute__((section(\".d2_sram_no_cache\")))\nstatic uint8_t dma_buffer[1024];\n\n/* 编译期断言：缓冲区大小必须是 2 的幂 */\n_Static_assert((DMA_RING_BUF_SIZE & (DMA_RING_BUF_SIZE - 1)) == 0,\n               \"DMA buffer size must be power of 2\");\n\n/* Cortex-M7 缓存刷新辅助函数 */\nstatic void dma_cache_invalidate(const void *addr, size_t size) {\n    uint32_t aligned_start = (uint32_t)addr & ~(32 - 1);\n    uint32_t aligned_end   = ((uint32_t)addr + size + 31) & ~(32 - 1);\n    SCB_InvalidateDCache_by_Addr((uint32_t *)aligned_start,\n                                  aligned_end - aligned_start);\n}\n\n/* 在中断中：只做标志置位，不处理数据 */\nvoid DMA2_Stream5_IRQHandler(void) {\n    if (__HAL_DMA_GET_FLAG(&hdma_usart1_rx, DMA_FLAG_FEIF5)) {\n        __HAL_DMA_CLEAR_FLAG(&hdma_usart1_rx, DMA_FLAG_FEIF5);\n    }\n    HAL_DMA_IRQHandler(&hdma_usart1_rx);\n    /* 注意：不在这里调用 dma_ring_read()！*/\n}\n\n/* 主循环或 RTOS 任务中：安全读取 */\nvoid app_process_uart(void) {\n    uint16_t avail = dma_ring_available(&uart1_ring);\n    if (avail > 0) {\n        const uint8_t *data;\n        uint16_t len = dma_ring_peek(&uart1_ring, &data, &len);\n        process_protocol_frame(data, len);\n        dma_ring_consume(&uart1_ring, len);\n    }\n}",
       "pitfalls": [
-        "陷阱1：current_state 被内存越界覆盖 → 症状：switch default 频繁触发，系统反复回到 IDLE → 触发条件：frame_buffer 写入超过 256 字节 → 修复：使用 cppcheck --enable=all 做静态分析，或将 current_state 放在独立段并用 __attribute__((section(\".state_monitor\"))) 标记",
-        "陷阱2：事件被覆盖导致协议解析丢字节 → 症状：CRC 校验失败率在 115200 波特率下从 0.01% 飙升到 5% → 触发条件：中断频率 > 主循环处理频率，且 event_received 是单变量非队列 → 修复：用环形事件队列（容量 8）替代单变量，入队时检查队列满，满则丢弃最旧事件",
-        "陷阱3：超时缺失导致状态机死锁 → 症状：设备接入串口后偶尔卡死，必须断电重启 → 触发条件：上位机发送了不完整的帧（如只发了头字节就断开） → 修复：在每个 case 入口处记录进入时间戳，每 N 毫秒检查一次是否超时，超时则跳转到 IDLE 并发送错误码",
-        "陷阱4：switch fall-through 意外合并 case → 症状：STATE_SYNC 处理完后继续执行 STATE_ADDR 的逻辑 → 触发条件：开发者意图利用 C 的 fall-through 合并相同逻辑的 case，但忘记在所有分支末尾写 break → 修复：启用编译器警告 -Wimplicit-fallthrough=4（GCC 8+），每个 case 末尾必须有 break 或注释说明故意 fall-through",
-        "陷阱5：状态转移不是原子的 → 症状：高负载下 handle_event() 执行到新事件到达，旧状态处理了新事件 → 触发条件：中断优先级高于主循环且事件频率 > 1kHz → 修复：在 handle_event() 入口 __disable_irq()，出口 __enable_irq()，或使用 atomic_store/atomic_load"
+        "陷阱1 — 缓存一致性：触发条件 = Cortex-M7 启用 D-Cache 且 DMA 缓冲区在 AXI SRAM 普通区域 → 症状 = CPU 读到旧数据，协议偶尔解析失败，与 CPU 负载相关 → 修复 = 将缓冲区放到无缓存段（.d2_sram_no_cache）或调用 SCB_InvalidateDCache_by_Addr() 刷新",
+        "陷阱2 — DMA Stream 选错：触发条件 = 查表错误把 USART1 RX 配到 DMA2 Stream5 Channel 4 → 症状 = DMA 不触发或数据传送到 SDIO → 修复 = 查 RM0090 DMA 请求映射表确认 USART1 RX = DMA2 Stream2 Channel 4",
+        "陷阱3 — 回调中阻塞：触发条件 = 在 HAL_UARTEx_RxEventCallback 中调用 printf 或 vTaskDelay → 症状 = DMA 中断被占住，后续数据丢失，WWDG 复位 → 修复 = 回调只做标志置位（<10µs），数据处理放主循环",
+        "陷阱4 — 非 2 的幂缓冲区：触发条件 = 缓冲区大小设为 300 并用位掩码优化取模 → 症状 = available() 返回错误值，数据覆盖或死循环 → 修复 = 用 _Static_assert 强制 2 的幂，推荐 256/512/1024",
+        "陷阱5 — Idle 超时设置不当：触发条件 = 两帧间隔超过 RTOR 默认值（1 字符时间 ≈ 87µs@115200）→ 症状 = RxEventCallback 不触发，数据堆积在 DMA 缓冲区但不通知应用层 → 修复 = 设置 RTOR = 3（3 个字符时间 ≈ 260µs）",
+        "陷阱6 — write_ptr 非原子读取：触发条件 = Cortex-M0/M3 上 write_ptr 跨 2 字节边界 → 症状 = 读到 DMA 更新中途的混合值，available 计算错误 → 修复 = 确保 2 字节对齐或使用 __atomic_load_n",
+        "陷阱7 — ping-pong 竞态：触发条件 = HalfTransfer 回调开始处理前半块但应用层也在读 → 症状 = 数据撕裂，读到部分新部分旧 → 修复 = 优先用单缓冲区 + available 计数模式，避免双缓冲竞态"
       ],
       "refBook": [
-        "《人月神话》第8章 外科手术团队",
-        "《人月神话》第12章 没有银弹",
-        "《代码大全》ch5 防御性编程",
-        "《C陷阱与缺陷》ch4 库"
+        "《人月神话》ch3 — 计划再计划：低估 DMA 复杂度的系统性偏差",
+        "《C陷阱与缺陷》ch4 — 库函数与硬件交互的隐含假设",
+        "《代码大全》ch5 — 防御性编程：对硬件状态做显式验证"
       ]
     },
     {
-      "id": "2026-05-05-state-machine-refactor",
-      "title": "从 goto 状态机到枚举 switch 的重构实践",
-      "topic": "状态机",
+      "id": "2026-05-05-dma-refactor",
+      "title": "从轮询 UART 到 DMA 循环接收的重构：性能与可靠性的双重提升",
+      "topic": "DMA 循环缓冲区",
       "mode": "refactor",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "GCC",
-      "snippetType": "pattern",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["状态机", "重构", "goto", "switch", "可维护性"],
-      "explanation": "《重构》中 Martin Fowler 开篇第一个例子就是将重复代码提取为函数。在状态机语境下，最大的坏味道是\\\"分散的控制流\\\"——goto 让状态转移变成了一张蜘蛛网，任何修改都需要追踪整张网。「任何傻瓜都能写出计算机能理解的代码，好的程序员写出人类能理解的代码。」——《重构》第 2 版序言",
-      "content": "下面展示一个真实的重构案例：某物联网网关固件中，设备管理模块最初用 goto 实现了状态机。代码看起来像 spaghetti code——从 STATE_CONNECTING 跳到 STATE_AUTHENTICATING，又跳到 STATE_CONNECTED，中间穿插着大量的 if-else 判断和 goto label。这种代码的问题是：你无法一眼看出完整的状态转移图，每次添加新状态都需要修改多处代码，且容易遗漏某些转移路径。\n\n重构的目标是将 goto-based 状态机转换为 enum + switch 结构。重构前大约 300 行代码分布在 3 个函数中，goto label 多达 12 个。重构后合并为 1 个 handle_device_event() 函数，约 180 行，switch case 数量等于状态数（8 个），每个 case 只处理当前状态的事件。\n\n重构的具体步骤：第一步，列出所有 goto label 并映射为 enum 状态；第二步，识别每个 label 前面的条件判断，将其提取为 switch case 的 guard condition；第三步，将 goto 替换为对 current_state 的赋值；第四步，删除不再使用的 label 和 goto 语句；第五步，添加 -Wswitch-enum 编译选项验证所有状态都被覆盖。\n\n代价：代码行数减少了 40%，但理解每个 case 的内部逻辑需要更多时间——因为之前分散的代码现在集中在了一个函数里。不过这个代价是值得的，因为后续添加新状态只需要在 switch 中增加一个 case，而不需要在多个函数中修改 goto 目标。同时，单元测试覆盖率从 35% 提升到 82%——因为每个 case 可以独立测试。\n\n《UNIX编程艺术》中提到\\\"Make it clear, not clever\\\"——清晰优于巧妙。enum + switch 状态机可能不是最快的实现方式（函数指针表更快），但它是最清晰的。在嵌入式领域，清晰就是可靠性。",
-      "code": "/* ===== 重构前：goto 状态机（坏味道：分散的控制流） ===== */\nvoid device_manager_run(void) {\n    connect_to_server();\n    goto AUTHENTICATE;\n\nAUTHENTICATE:\n    if (auth_success()) {\n        goto CONNECTED;\n    } else if (auth_retry_count++ > 3) {\n        goto ERROR;\n    } else {\n        goto AUTHENTICATE;\n    }\n\nCONNECTED:\n    while (1) {\n        if (data_available()) {\n            process_data();\n            if (should_disconnect()) goto DISCONNECT;\n        }\n        if (heartbeat_timeout()) goto RECONNECT;\n    }\n\nRECONNECT:\n    disconnect_from_server();\n    connect_to_server();\n    goto AUTHENTICATE;\n\nDISCONNECT:\n    cleanup_resources();\n    goto IDLE;\n\nERROR:\n    log_error(\"Fatal error\");\n    while (1) {}  /* 死循环 */\n\nIDLE:\n    ;  /* 空闲等待 */\n}\n\n/* ===== 重构后：enum + switch 状态机（清晰的结构） ===== */\ntypedef enum { DEV_IDLE, DEV_CONNECTING, DEV_AUTHENTICATING, DEV_CONNECTED, DEV_RECONNECTING, DEV_ERROR } dev_state_t;\nstatic volatile dev_state_t dev_state = DEV_IDLE;\n\nvoid device_manager_handle(void) {\n    switch (dev_state) {\n    case DEV_IDLE:\n        if (should_connect()) {\n            connect_to_server();\n            dev_state = DEV_CONNECTING;\n        }\n        break;\n\n    case DEV_CONNECTING:\n        if (connection_established()) dev_state = DEV_AUTHENTICATING;\n        else if (connect_timeout()) dev_state = DEV_ERROR;\n        break;\n\n    case DEV_AUTHENTICATING:\n        if (auth_success()) dev_state = DEV_CONNECTED;\n        else if (++auth_retries > 3) dev_state = DEV_ERROR;\n        break;\n\n    case DEV_CONNECTED:\n        if (data_available()) process_incoming_data();\n        if (heartbeat_missed()) send_heartbeat();\n        if (disconnect_requested()) { dev_state = DEV_IDLE; cleanup_resources(); }\n        break;\n\n    case DEV_RECONNECTING:\n        if (reconnect_complete()) dev_state = DEV_AUTHENTICATING;\n        break;\n\n    case DEV_ERROR:\n        log_error(\"Device error, resetting\");\n        dev_state = DEV_IDLE;\n        break;\n    }\n}",
+      "tags": ["DMA", "UART", "重构", "轮询", "零拷贝"],
+      "explanation": "《重构》Martin Fowler 提出的第一个坏味道是「过长函数」，第二个是「重复代码」。在 UART 接收场景中，轮询方式的问题是：CPU 在 while(!HAL_UART_GetState(&huart1) == READY) 中空转，占用大量 CPU 周期且无法响应其他事件。Fowler 在「引入解释对象」一节中指出：「当一段逻辑的意图被实现细节淹没时，就应该提取出来。」DMA 循环接收正是将「数据搬运」的意图从 CPU 空转中提取给硬件。「自动化那些机械重复的工作。」——《重构》第 3 章",
+      "content": "下面展示一个典型的轮询 UART 接收代码到 DMA 循环接收的重构过程。改造前：主循环每 1ms 调用 HAL_UART_Receive() 读取 1 个字节，CPU 利用率 35%（168MHz），在 115200 波特率下最多处理约 11500 字节/秒，但 CPU 花费了大量时间在等待循环中。改造后：DMA 在后台持续搬运数据到环形缓冲区，CPU 只在有可用数据时处理应用层逻辑，CPU 利用率降到 8%，吞吐量上限提升到 1MB/s（受限于 CPU 处理速度而非 UART 波特率）。\n\n重构步骤：第一步，定义环形缓冲区结构体，包含 buffer、read_ptr、write_ptr；第二步，配置 DMA 为循环模式，启动 HAL_UARTEx_ReceiveToIdle_DMA()；第三步，实现 HalfTransfer 和 TransferComplete 回调，置位标志；第四步，将主循环中的轮询读取替换为 dma_ring_available() + dma_ring_read()；第五步，添加缓冲区溢出保护——当 available > BUFFER_SIZE * 0.8 时丢弃最旧数据或上报错误。\n\n代价分析：代码量从 40 行增加到约 120 行，但这是值得的。新增的复杂度集中在驱动层（一次性编写），应用层反而更简单。Flash 增加约 2KB（DMA 配置 + 回调 + 环形缓冲区逻辑），RAM 增加 512 字节缓冲区 + 16 字节控制结构。对于一个 64KB flash / 20KB RAM 的 STM32F103 来说需要谨慎评估；对于 1MB flash / 512KB RAM 的 STM32F765 则毫无压力。",
+      "code": "/* ===== 重构前：轮询 UART 接收（坏味道：CPU 空转） ===== */\n/* 主循环每 1ms 调用一次 */\nvoid Uart1_Poll_Task(void) {\n    uint8_t byte;\n    while (HAL_UART_Receive(&huart1, &byte, 1, 10) == HAL_OK) {\n        if (byte == FRAME_START) {\n            frame_idx = 0;\n            in_frame = 1;\n        } else if (in_frame) {\n            frame_buf[frame_idx++] = byte;\n            if (frame_idx >= MAX_FRAME_LEN) {\n                in_frame = 0;  /* 超时重置 */\n            }\n        }\n    }\n    /* 问题：如果 1ms 内没有数据，CPU 白白空转\n     * 如果数据突发超过 1ms 到达，字节被丢弃 */\n}\n\n/* ===== 重构后：DMA 循环接收（零拷贝 + 事件驱动） ===== */\n\n/* 环形缓冲区结构 */\ntypedef struct {\n    volatile uint16_t write_ptr;\n    uint16_t          read_ptr;\n    uint8_t           buffer[512];\n} dma_ring_buf_t;\n\nstatic dma_ring_buf_t ring;\nstatic volatile uint8_t dma_half_ready = 0;\n\nvoid Uart1_Dma_Init(void) {\n    HAL_UARTEx_ReceiveToIdle_DMA(\n        &huart1, ring.buffer, sizeof(ring.buffer));\n}\n\nvoid HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart,\n                                 uint16_t Size) {\n    if (huart->Instance == USART1)\n        dma_half_ready = 1;\n}\n\n/* 主循环：只在有数据时处理 */\nvoid Uart1_DMA_Task(void) {\n    /* 检查 HalfTransfer 标志 */\n    if (dma_half_ready) {\n        dma_half_ready = 0;\n        /* 处理 ring.buffer 中已填满的前半部分 */\n        process_pending_data();\n    }\n\n    /* 常规可用数据处理 */\n    uint16_t avail = (ring.write_ptr - ring.read_ptr + 512) & 511;\n    if (avail > 0) {\n        uint8_t byte = ring.buffer[ring.read_ptr];\n        ring.read_ptr = (ring.read_ptr + 1) & 511;\n        handle_byte(byte);\n    }\n    /* 优势：无数据时 CPU 可以做其他事\n     * 突发数据不会丢失（DMA 持续搬运） */\n}",
       "pitfalls": [
-        "陷阱1：重构后遗漏了 goto 中的某些边界条件 → 症状：AUTHENTICATE 标签下有 auth_retry_count++ > 3 的判断，但重构后的 switch 中写成了 auth_retries > 3 而忘记初始化 auth_retries = 0 → 修复：重构后逐项对比 goto 分支和 switch case，确保所有边界条件都被迁移",
-        "陷阱2：switch 中忘记设置初始状态 → 症状：系统上电后 dev_state 是栈上的随机值，handle_manager() 进入未定义的 case → 修复：在文件作用域声明时显式初始化 static volatile dev_state_t dev_state = DEV_IDLE",
-        "陷阱3：重构后 goto 中的死循环 while(1) {} 被遗忘 → 症状：DEV_ERROR 状态不再死循环，而是回到 DEV_IDLE，导致错误状态下设备不断尝试重连 → 修复：确认错误处理策略——如果需要永久停机则在 case DEV_ERROR 中保留 while(1)，如果需要自动恢复则回到 DEV_IDLE 并重连"
+        "陷阱1：重构后忘记清除 HalfTransfer 标志 → 症状：dma_half_ready 一直保持 1，process_pending_data() 在每个任务周期都被调用，即使没有新数据 → 修复：在处理完数据后立即 dma_half_ready = 0",
+        "陷阱2：write_ptr 没有正确更新 → 症状：available 始终为 0 或错误值，应用层收不到数据 → 修复：确保在 DMA 回调中根据 __HAL_DMA_GET_COUNTER(&hdma) 更新 ring.write_ptr = BUF_SIZE - counter",
+        "陷阱3：重构后没有处理缓冲区溢出 → 症状：高速数据流下 ring.read_ptr 追不上 ring.write_ptr，缓冲区满后 DMA 覆盖未处理数据 → 修复：添加溢出检测 if (avail > 400) { ring.read_ptr = ring.write_ptr; error_count++; }，丢弃最旧数据并上报"
       ],
       "refBook": [
-        "《重构》ch1 第一个重构示例",
-        "《UNIX编程艺术》ch2.3 清晰优于聪明",
-        "《人月神话》第12章 没有银弹"
+        "《重构》ch3 — 搬移成员：将数据搬运逻辑从 CPU 移到 DMA 硬件",
+        "《UNIX编程艺术》ch5 — 设计原则：让程序做一件事并做好",
+        "《代码大全》ch18 — 程序片区的组织：分离初始化、运行、回调"
       ]
     }
   ]
