@@ -1,107 +1,71 @@
 {
   "date": "2026-05-05",
-  "topic": "FreeRTOS 任务间通信的坑",
+  "topic": "低功耗设计的几个层次",
   "items": [
     {
-      "id": "2026-05-05-freertos-ipc-architecture",
-      "title": "FreeRTOS 任务通信架构：从共享内存到消息传递的边界设计",
-      "topic": "FreeRTOS 任务通信",
+      "id": "2026-05-05-power-layers",
+      "title": "低功耗四层架构：从时钟树到系统级电源管理",
+      "topic": "低功耗设计",
       "mode": "architecture",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "FreeRTOS",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
       "snippetType": "pattern",
-      "difficulty": "intermediate",
-      "tags": ["FreeRTOS", "任务通信", "消息队列", "信号量", "架构设计"],
-      "explanation": "《UNIX编程艺术》第 5.4 节提出「使用管道连接小工具」的原则：模块之间应该通过明确定义的接口交换数据，而不是共享内部状态。「每个程序都应该做一件事，并做好。」——《UNIX编程艺术》第 5 章",
-      "content": "FreeRTOS 任务间通信有三种基本范式：共享内存 + 互斥锁、消息队列（Queue）、事件组（EventGroup）。选择哪种范式取决于数据流向和一致性要求。\n\n第一种是共享内存模式。两个任务访问同一块 RAM，用 xSemaphoreCreateMutex() 保护临界区。这种方式的优点是实现简单、零拷贝，缺点是耦合度高——发送方和接收方必须就数据格式、生命周期、更新顺序达成一致。《C语言接口与实现》中的 ADT 原则警告我们：如果两个模块共享内部数据结构，它们就被绑定了，修改一方可能导致另一方静默崩溃。\n\n第二种是消息队列模式。这是 FreeRTOS 最推荐的通信方式。发送方调用 xQueueSend()，接收方调用 xQueueReceive()。数据在队列中复制一份，发送方和接收方完全解耦。队列本身是 FIFO 结构，可以设置深度（如 10 个元素），每个元素大小固定（如 sizeof(sensor_data_t) = 12 字节）。当队列满时，xQueueSend() 可以阻塞等待（pdMS_TO_TICKS(100)），也可以直接返回 errQUEUE_FULL。\n\n第三种是事件组模式。适合一对多的通知场景。比如一个传感器任务同时通知控制任务和日志任务。事件组用位掩码表示事件（bit 0 = 温度就绪，bit 1 = 湿度就绪），任务用 xEventGroupWaitBits() 等待特定位组合。优点是低开销（一个 uint8_t 或 uint32_t），缺点是不能传递数据，只能传递信号。\n\n架构选型的关键权衡：\n\n1）延迟 vs 解耦。共享内存在同一 CPU 核内延迟最低（几微秒），但耦合最高。消息队列延迟稍高（需要上下文切换 + 内存复制），但任务完全独立。\n\n2）可靠性 vs 复杂度。事件组最简单，但如果需要传递结构化数据就必须配合队列使用。实际项目中常见组合是：事件组做触发信号，队列做数据通道。\n\n3）《人月神话》说「没有银弹」。消息队列虽然解耦，但引入了新的调试维度——队列满、队列空、任务优先级反转、栈溢出。你并没有消除复杂度，只是把它从共享内存的竞态转移到了队列管理上。\n\n推荐的分层架构：硬件驱动层通过中断把原始数据放入队列；应用层任务从队列取出数据做处理；控制层任务根据事件组信号决定何时读取控制参数队列。每一层只知道自己上游和下游的接口，不知道整个系统的全貌。这就是《UNIX编程艺术》所说的「清晰优于聪明」。\n\n实际容量估算：假设三个任务各需要 256 字节的队列，每个队列元素 12 字节，深度 10，则队列 RAM 消耗 = 3 × 10 × 12 = 360 字节。加上 FreeRTOS 内核为每个队列分配的 pxQueueStructure（约 40 字节），总消耗约 480 字节。对于 STM32F103 的 20KB RAM 来说微不足道，但在资源受限的 Cortex-M0（2KB RAM）上就需要仔细规划。",
-      "code": "/* FreeRTOS 任务通信架构：三种范式的接口定义 */\n\n/* 范式 1：共享内存 + 互斥锁（不推荐用于跨模块通信）*/\ntypedef struct {\n    volatile uint32_t temperature;\n    volatile uint32_t humidity;\n} shared_sensor_data_t;\n\n/* 范式 2：消息队列（推荐用于数据传输）*/\ntypedef struct {\n    uint16_t sensor_id;\n    int16_t  temperature_x10;   /* 25.3°C -> 253 */\n    uint16_t humidity_x2;       /* 65% -> 130 */\n    uint32_t timestamp_ms;\n} sensor_msg_t;                /* 12 bytes */\n\nQueueHandle_t xSensorQueue;\n\n/* 范式 3：事件组（推荐用于触发信号）*/\n#define BIT_TEMP_READY    (1 << 0)\n#define BIT_HUMID_READY   (1 << 1)\n#define BIT_ALL_READY     (BIT_TEMP_READY | BIT_HUMID_READY)\n\nEventGroupHandle_t xSensorEvents;\n\n/* 创建接口 */\nxSensorQueue = xQueueCreate(10, sizeof(sensor_msg_t));\nxSensorEvents = xEventGroupCreate();\n\n/* 生产者：发送数据 */\nvoid producer_task(void *pvParameters) {\n    sensor_msg_t msg = { .sensor_id = 1, .temperature_x10 = 253 };\n    xQueueSend(xSensorQueue, &msg, pdMS_TO_TICKS(100));\n}\n\n/* 消费者：接收数据 */\nvoid consumer_task(void *pvParameters) {\n    sensor_msg_t msg;\n    if (xQueueReceive(xSensorQueue, &msg, pdMS_TO_TICKS(500)) == pdPASS) {\n        /* 处理 msg */\n    }\n}",
-      "pitfalls": [],
-      "refBook": [
-        "《UNIX编程艺术》ch5 — 模块原则：使用管道连接小工具",
-        "《C语言接口与实现》ch2 — 抽象数据类型：信息隐藏",
-        "《人月神话》ch12 — 没有银弹：复杂度守恒"
-      ]
+      "difficulty": "advanced",
+      "tags": ["低功耗", "电源管理", "时钟树", "STOP模式"],
+      "explanation": "低功耗不是调一个寄存器就能解决的问题——它是时钟、电压、核心和系统四个层次的协同优化，每一层都影响下一层的可达深度。「没有银弹，只有系统工程。」——《人月神话》ch11",
+      "content": "低功耗设计在嵌入式系统中是一个四层架构问题。最底层是时钟树控制——通过 RCC 寄存器位清零来关闭不需要的模块时钟，这是零成本优化，每个模块可节省 10-100uA。第二层是电压域调节——通过 PWR_CR1.VOS 字段降低核心供电电压，每降 0.1V 功耗约降 5%，代价是 ADC 精度下降和最大主频受限。第三层是核心睡眠模式选择——SLEEP 模式只停 CPU 不停外设（约 200uA），DEEPSLEEP 使用 LSI/LSE 时钟且可选保留 SRAM（约 5-20uA），STOP2 模式在 SCALE3 电压下可达约 1.1uA，STANDBY 模式则完全断电仅靠 RTC 或 WKUP 引脚唤醒（约 3uA）。最高层是系统级电源管理——将外围模块逐个断电，配合策略模式注册 pre_enter 和 post_wakeup 回调，让管理器自动选择当前场景下最深的安全睡眠模式。这四个层次不是互斥的，而是递进关系：时钟门控是所有模式的 prerequisites，电压调节决定 STOP 模式的最低可达电流，核心模式选择决定唤醒延迟和 RAM 保留策略，系统级管理决定实际部署时的组合策略。《UNIX编程艺术》ch6 的组合性原则在这里体现为：每个层次独立可测，组合起来才是完整的低功耗方案。代价在于——调试器连接会阻止深度睡眠测量，必须在 Release 无调试环境下用源表实测；唤醒源设计也需要逐层考虑，EXTI 引脚支持全部模式但延迟 5us，RTC 闹钟仅支持 DEEPSLEEP+ 模式。"
     },
     {
-      "id": "2026-05-05-freertos-queue-snippet",
-      "title": "FreeRTOS 队列生产-消费模板：带超时、优先级继承和溢出保护的完整实现",
-      "topic": "FreeRTOS 任务通信",
+      "id": "2026-05-05-power-snippet",
+      "title": "进入 STOP2 模式的正确序列",
+      "topic": "低功耗设计",
       "mode": "snippet",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "FreeRTOS",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": ["FreeRTOS", "队列", "生产者消费者", "优先级继承", "超时"],
-      "explanation": "《代码大全》ch12「防御性编程」强调：「对可能失败的操作，永远检查返回值。」FreeRTOS 队列函数几乎都有返回值，忽略它们是最常见的 bug 来源。「先保证能跑起来，再优化速度。」——《代码大全》第 12 章",
-      "content": "下面是一个生产-消费模式的完整队列实现模板，覆盖队列创建、发送、接收、超时处理和溢出统计。适用于 STM32 上传感器数据从采集任务传递到处理任务的典型场景。\n\n关键参数：队列深度 16，每个元素 sizeof(command_t) = 8 字节，发送超时 100ms，接收超时 500ms。使用 pdQUEUE_SEND_FROM_ISR 宏从中断安全发送。队列满时不是丢弃新数据，而是统计溢出计数并在日志中记录。\n\n中断优先级：假设采集中断优先级为 3（高），处理任务优先级为 2（低）。队列发送从采集 ISR 中完成，接收在处理任务中完成。由于 FreeRTOS 的队列操作是原子的（在单核 Cortex-M 上通过关闭中断保护），不需要额外的互斥锁。\n\nxQueueSendFromISR 的返回值很重要：如果队列满返回 errQUEUE_FULL，此时必须调用 uxQueueMessagesWaiting() 检查当前积压量，决定是否丢弃最旧数据或上报错误。\n\n阻塞超时使用 pdMS_TO_TICKS() 宏转换为 tick 数。如果传 portMAX_DELAY，任务将永久阻塞直到有数据——适合主循环任务，但不适合需要定期执行心跳的任务。",
-      "code": "#include \"FreeRTOS.h\"\n#include \"queue.h\"\n#include \"task.h\"\n\n/* 命令结构体：8 字节，适合实时控制 */\ntypedef struct {\n    uint8_t  cmd_id;\n    int16_t  value_x100;      /* 放大 100 倍避免浮点 */\n    uint32_t timestamp_ms;\n} command_t;\n\n#define CMD_QUEUE_DEPTH   16\n#define CMD_SEND_TIMEOUT  pdMS_TO_TICKS(100)\n#define CMD_RECV_TIMEOUT  pdMS_TO_TICKS(500)\n\nstatic QueueHandle_t xCmdQueue;\nstatic volatile uint32_t uxOverflowCount = 0;\n\n/* 初始化：创建队列 */\nBaseType_t CmdQueue_Init(void) {\n    xCmdQueue = xQueueCreate(CMD_QUEUE_DEPTH, sizeof(command_t));\n    return (xCmdQueue != NULL) ? pdPASS : pdFAIL;\n}\n\n/* 生产者：从采集 ISR 安全发送命令 */\nBaseType_t CmdQueue_SendFromISR(command_t *cmd) {\n    BaseType_t xHigherPriorityTaskWoken = pdFALSE;\n    BaseType_t ret = xQueueSendFromISR(\n        xCmdQueue, cmd, &xHigherPriorityTaskWoken);\n    \n    if (ret != pdPASS) {\n        uxOverflowCount++;  /* 队列满，丢弃并计数 */\n        if (uxOverflowCount > 100) {\n            /* 溢出过多，触发告警任务提高优先级 */\n            vTaskPrioritySet(NULL, tskIDLE_PRIORITY + 3);\n        }\n    }\n    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);\n    return ret;\n}\n\n/* 消费者：处理任务中接收命令 */\nvoid CmdProcessor_Task(void *pvParameters) {\n    command_t cmd;\n    while (1) {\n        if (xQueueReceive(xCmdQueue, &cmd,\n                          CMD_RECV_TIMEOUT) == pdPASS) {\n            switch (cmd.cmd_id) {\n                case CMD_SET_PWM:\n                    TIM2->CCR1 = (uint16_t)(cmd.value_x100 / 10);\n                    break;\n                case CMD_LOG_DATA:\n                    Log_Write(cmd.timestamp_ms, cmd.value_x100);\n                    break;\n                default:\n                    /* 未知命令，忽略 */\n                    break;\n            }\n        } else {\n            /* 超时：发送心跳或执行周期性维护 */\n            Heartbeat_Ping();\n        }\n    }\n}",
-      "pitfalls": [
-        "陷阱1：忽略 xQueueSendFromISR 的返回值 → 症状：队列满时数据静默丢失，系统运行时偶尔丢命令但无法追溯 → 修复：始终检查返回值，队列满时增加溢出计数器并在条件满足时触发告警",
-        "陷阱2：在 ISR 中使用 xQueueSend 而非 xQueueSendFromISR → 症状：编译通过但运行时无限进入 HardFault，因为 xQueueSend 内部调用 vPortDisableInterrupts 导致嵌套关中断 → 修复：ISR 中必须使用 xQueueSendFromISR 或 xQueueSendFromISR_toTail",
-        "陷阱3：接收超时设为 portMAX_DELAY 但任务需要周期性心跳 → 症状：任务永久阻塞在 xQueueReceive，心跳函数永远不会执行，看门狗复位 → 修复：使用 pdMS_TO_TICKS(500) 等有限超时，超时分支处理心跳和维护逻辑"
-      ],
-      "refBook": [
-        "《代码大全》ch12 — 防御性编程：检查所有外部交互的返回值",
-        "《C陷阱与缺陷》ch3 — 库函数参数的隐含契约：ISR 和常规函数的 API 不同",
-        "《UNIX编程艺术》ch5 — 可靠性：失败时要显式处理，不要静默吞掉"
-      ]
+      "tags": ["STOP2", "PWR", "时钟门控", "HAL"],
+      "explanation": "进睡眠前关闭 ADC 电源域是 STOP2 电流达标的关键一步，漏掉这一行电流直接从 1.1uA 飙升到 200uA。「正确的顺序比正确的代码更重要。」——《代码大全》ch25",
+      "code": "```c\n/* 进入 STOP2 前的完整准备序列 */\nvoid system_enter_stop2(void)\n{\n    /* Step 1: 关闭所有不需要的时钟 */\n    __HAL_RCC_ADC_CLK_DISABLE();\n    __HAL_RCC_I2C1_CLK_DISABLE();\n    __HAL_RCC_SPI2_CLK_DISABLE();\n\n    /* Step 2: 确认 ADC 电源已断开 */\n    while (ADC1->CR & ADC_CR_ADEN) {\n        ADC1->CR &= ~ADC_CR_ADEN;\n    }\n\n    /* Step 3: 配置 GPIO 为模拟输入减少漏电 */\n    GPIOB->MODER = 0x00000000U;\n\n    /* Step 4: 清除旧唤醒标志，防止误唤醒 */\n    __HAL_PWR_CLEAR_WUF_FLAG();\n\n    /* Step 5: 设置 PWR_CR1 选择 STOP2 模式 */\n    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);\n\n    /* Step 6: 等待 VOS 位稳定 */\n    while (__HAL_PWR_GET_FLAG(PWR_FLAG_VOSRDY) == 0);\n\n    /* Step 7: 进入 STOP2 —— Halted 指令触发 */\n    HAL_PWR_EnterSTOPMode(PWR_LOWPOWERREGULATOR_ON,\n                          PWR_STOPENTRY_WFI);\n}\n```\n\n/* 唤醒后恢复序列（从 main 入口调用） */\nvoid system_post_wakeup(void)\n{\n    /* Step 1: 重新配置系统时钟（STOP 后默认 HSI） */\n    SystemClock_Config();\n\n    /* Step 2: 恢复外设初始化 */\n    HAL_ADCEx_Calibration_Start(&hadc1);\n    I2C1_Init();\n\n    /* Step 3: 清除唤醒标志防止重复进入 */\n    __HAL_PWR_CLEAR_WUF_FLAG();\n}"
     },
     {
-      "id": "2026-05-05-freertos-pitfalls",
-      "title": "FreeRTOS 任务通信的六个真实踩坑点：从优先级反转到栈溢出",
-      "topic": "FreeRTOS 任务通信",
+      "id": "2026-05-05-power-tips",
+      "title": "低功耗调试的 5 个致命陷阱",
+      "topic": "低功耗设计",
       "mode": "tip",
       "language": "C",
       "platform": "通用嵌入式",
-      "toolchain": "FreeRTOS",
+      "toolchain": "GCC",
       "snippetType": "note",
-      "difficulty": "advanced",
-      "tags": ["FreeRTOS", "优先级反转", "栈溢出", "死锁", "调试"],
-      "explanation": "《人月神话》Brooks 在 ch3「计划再计划」中指出：「开发者总是系统性低估任务的复杂度。」FreeRTOS 任务通信看起来只是 xQueueCreate + xQueueSend + xQueueReceive 三件事，但真实项目中至少有六个隐蔽的坑。「调试是科学方法在工程中最纯粹的应用。」——《C陷阱与缺陷》前言",
-      "content": "以下是 FreeRTOS 任务通信在实际项目中踩过的六个坑，按严重程度排序。\n\n坑1：优先级反转（Priority Inversion）\n场景：高优先级任务 H 等待低优先级任务 L 持有的互斥锁。中等优先级任务 M 先于 H 获得 CPU，导致 H 被 M 阻塞，有效优先级低于 M。\n现象：示波器看到 H 任务的响应时间从 1ms 变成 50ms，且与 M 任务的调度周期相关。\n修复：创建互斥锁时使用 xSemaphoreCreateMutex()（默认支持优先级继承），或者 xSemaphoreCreateRecursiveMutex()。优先级继承机制会在 H 等待锁时临时提升 L 的优先级到 H 的水平，防止 M 插队。不要用二进制信号量代替互斥锁——二进制信号量没有优先级继承。\n\n坑2：队列元素大小与指针混淆\n场景：xQueueSend(queue, &ptr, timeout) 发送的是指针地址，而不是指针指向的数据。如果 ptr 是局部变量，任务切换后 ptr 指向的内存可能被覆盖。\n现象：接收方读到的数据与发送方不同，且每次运行结果不一致。\n修复：确保发送的是静态变量或堆分配变量的地址，或者直接将结构体值入队（xQueueSend(queue, &msg, timeout)，其中 msg 是 static 或全局变量）。对于动态数据，使用 pvQueueSendFromISR 时注意生命周期。\n\n坑3：栈溢出（Stack Overflow）\n场景：任务 A 发送大数据到队列，队列回调函数中又触发嵌套调用。FreeRTOS 默认不检测栈溢出，除非配置 configCHECK_FOR_STACK_OVERFLOW > 0。\n现象：系统随机 HardFault，栈指针 SP 超出合法范围，MPU 报错。\n修复：为每个任务设置足够的栈空间。经验公式：任务栈大小 = 预计最大嵌套深度 × 每层帧大小（约 64-128 字节）× 1.5。STM32 上建议最小 256 字（1KB）用于通信密集型任务。启用 configCHECK_FOR_STACK_OVERFLOW = 2，配置 vApplicationStackOverflowHook() 打印任务名和栈使用情况。\n\n坑4：死锁（Deadlock）\n场景：任务 A 持有锁 1 等待锁 2，任务 B 持有锁 2 等待锁 1。或者两个任务通过队列互相发送数据，但都没有释放资源。\n现象：系统挂死，所有任务都在等待，看门狗复位。\n修复：遵循锁的获取顺序原则——所有任务按相同顺序获取锁（如先锁 A 再锁 B）。减少锁的数量，优先使用队列代替共享内存 + 锁。如果必须多锁，使用 try-lock 模式（xSemaphoreTakeRecursive 带超时）。\n\n坑5：中断与任务之间的队列操作竞态\n场景：ISR 中调用 xQueueSendFromISR 发送数据，任务中调用 xQueueReceive 接收。如果 ISR 在任务读取中间插入新数据，可能导致队列指针不一致。\n现象：队列数据错乱，接收到垃圾数据，或 uxMessagesWaiting 计数异常。\n修复：FreeRTOS 的队列操作在单核上是原子的（内部关闭中断），所以 xQueueSendFromISR + xQueueReceive 是安全的。但不要在 ISR 中调用普通 xQueueSend，也不要在任务中调用 xQueueSendFromISR。严格区分：ISR 用 FromISR 版本，任务用普通版本。\n\n坑6：事件组的位掩码溢出\n场景：多个任务同时设置同一个事件组的位，使用 xEventGroupSetBits()。如果位操作顺序不一致，可能出现部分位被覆盖的情况。\n现象：任务 B 设置了 bit 2，任务 C 设置了 bit 3，但事件组最终只有 bit 3，bit 2 丢失。\n修复：使用原子位操作。FreeRTOS 的 xEventGroupSetBits() 是原子的，但如果你手动组合位掩码再发送，要确保组合逻辑一致。推荐使用 #define 预定义组合：#define ALL_EVENTS (BIT_A | BIT_B | BIT_C)，然后 xEventGroupSetBits(event_group, ALL_EVENTS)。",
-      "code": "/* FreeRTOS 任务通信调试辅助：栈溢出检测 + 队列状态监控 */\n\n/* 启用栈溢出检测（FreeRTOSConfig.h）*/\n/* #define configCHECK_FOR_STACK_OVERFLOW  2 */\n\nvoid vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) {\n    /* 栈溢出时打印任务名，便于定位 */\n    printf(\"[FATAL] Stack overflow in task: %s\\r\\n\", pcTaskName);\n    /* 可以在此触发 LED 闪烁或进入调试模式 */\n    while(1) { }\n}\n\n/* 队列状态监控任务：定期检查队列健康 */\nvoid QueueMonitor_Task(void *pvParameters) {\n    while (1) {\n        uint32_t queued = uxQueueMessagesWaiting(xCmdQueue);\n        uint32_t free = uxQueueSpacesAvailable(xCmdQueue);\n        \n        if (queued > CMD_QUEUE_DEPTH * 0.8) {\n            printf(\"[WARN] Queue near full: %lu/%lu\\r\\n\", \n                   queued, CMD_QUEUE_DEPTH);\n        }\n        if (free == 0 && uxOverflowCount > 0) {\n            printf(\"[ERROR] Queue overflow detected: %lu times\\r\\n\",\n                   uxOverflowCount);\n            /* 可以在此重置系统或进入安全模式 */\n        }\n        \n        vTaskDelay(pdMS_TO_TICKS(1000));\n    }\n}\n\n/* 优先级继承验证：确认使用 Mutex 而非 Binary Semaphore */\nSemaphoreHandle_t xSharedDataMutex;\n\nvoid HighPriority_Task(void *pvParameters) {\n    /* 正确：使用 Mutex，自动优先级继承 */\n    if (xSemaphoreTake(xSharedDataMutex, pdMS_TO_TICKS(100)) == pdPASS) {\n        /* 访问共享数据 */\n        xSemaphoreGive(xSharedDataMutex);\n    }\n    /* 错误示例（注释）：\n    if (xSemaphoreTake(xBinarySem, ...) == pdPASS) { ... }\n    二进制信号量没有优先级继承！*/\n}",
+      "difficulty": "intermediate",
+      "tags": ["低功耗", "调试陷阱", "电流测量", "唤醒"],
+      "explanation": "反复唤醒死循环是最隐蔽的低功耗 bug——现象是电流偏高，根因却是标志位没清。「计划再计划」——你总以为只少了一行清除标志的代码，实际上它会让整个功耗预算失效。」——《人月神话》ch11",
+      "code": "",
       "pitfalls": [
-        "陷阱1 — 优先级反转：触发条件 = 高优先级任务等待低优先级任务持有的普通二进制信号量 → 症状 = 高优先级任务响应延迟从 1ms 增至 50ms，与中等优先级任务调度相关 → 修复 = 使用 xSemaphoreCreateMutex()（支持优先级继承），绝不使用二进制信号量替代互斥锁",
-        "陷阱2 — 栈溢出：触发条件 = 任务栈太小（如 128 字）且存在深层嵌套调用 → 症状 = 随机 HardFault，SP 超出合法范围 → 修复 = configCHECK_FOR_STACK_OVERFLOW=2 + vApplicationStackOverflowHook + 任务栈至少 256 字（1KB）",
-        "陷阱3 — 死锁：触发条件 = 两个任务以不同顺序获取两把锁 → 症状 = 所有任务等待，系统挂死，WWDG 复位 → 修复 = 统一锁获取顺序，或用队列替代共享内存+锁",
-        "陷阱4 — ISR 使用错误 API：触发条件 = 在中断中调用 xQueueSend 而非 xQueueSendFromISR → 症状 = 嵌套关中断导致 HardFault → 修复 = ISR 严格使用 FromISR 版本",
-        "陷阱5 — 事件组位掩码覆盖：触发条件 = 多个任务手动组合位掩码后发送 → 症状 = 部分事件位丢失 → 修复 = 预定义组合常量 + 使用原子 xEventGroupSetBits()",
-        "陷阱6 — 队列指针生命周期：触发条件 = 发送局部变量指针到队列 → 症状 = 接收方读到覆盖后的垃圾数据 → 修复 = 发送静态/全局变量地址，或直接发送结构体值"
+        "陷阱1（反复唤醒死循环）：触发条件——唤醒后未调用 __HAL_PWR_CLEAR_WUF_FLAG() 清除 PWR_SR1.SBF 标志 → 症状——电流 500uA（预期 5uA），MCU 每 50ms 自动重新进入睡眠又立即唤醒 → 修复方法——在主循环入口和每次进入睡眠前各调一次清除标志",
+        "陷阱2（GPIO 上拉漏电）：触发条件——未使用的 GPIO 保持默认上拉配置 → 症状——静置电流多出 33-100uA，在电池供电设备中续航缩短 30% → 修复方法——进睡眠前将未用 GPIO 的 MODER 设为 0x00000000（模拟输入），WKUP 引脚确保无上拉电阻",
+        "陷阱3（ADC/DAC 电源域未关）：触发条件——进入 STOP 前未确认 ADC_CR.ADEN=0 → 症状——STOP2 电流 200uA（手册标称 1.1uA），差两个数量级 → 修复方法——__HAL_RCC_ADC_CLK_DISABLE() 后读回 ADC1->CR 确认 ADEN 位为零",
+        "陷阱4（调试器阻止深度睡眠）：触发条件——IDE 连接 SWD 调试器时测量电流 → 症状——测到 50uA 以为达标，拔掉调试器后回到 5mA RUN 模式 → 修复方法——永远在 Release 构建 + 无调试器环境下测量；如需保留调试用 DBGMCU->CR.SLEEP_DBG=1",
+        "陷阱5（时钟恢复顺序错误）：触发条件——唤醒后先使能外设时钟再调用 SystemClock_Config() → 症状——HardFault 或 I2C/SPI 通信失败，电流增加 200-500uA → 修复方法——严格按顺序：①Flash 延迟配置 ②SystemClock_Config() ③外设时钟使能"
       ],
-      "refBook": [
-        "《人月神话》ch3 — 计划再计划：低估通信复杂度的系统性偏差",
-        "《C陷阱与缺陷》ch4 — 库函数与硬件交互的隐含假设：ISR 和任务 API 不同",
-        "《代码大全》ch5 — 防御性编程：对队列状态做显式验证",
-        "《重构》ch2 — 代码坏味道：重复的锁获取逻辑是提取信号量的信号"
-      ]
+      "refBook": ["《人月神话》ch11", "《C陷阱与缺陷》ch4"]
     },
     {
-      "id": "2026-05-05-freertos-refactor",
-      "title": "从轮询等待到事件驱动：FreeRTOS 任务通信重构示范",
-      "topic": "FreeRTOS 任务通信",
+      "id": "2026-05-05-power-refactor",
+      "title": "从散乱调用到策略模式：电源管理器重构",
+      "topic": "低功耗设计",
       "mode": "refactor",
       "language": "C",
-      "platform": "通用嵌入式",
-      "toolchain": "FreeRTOS",
-      "snippetType": "driver",
-      "difficulty": "intermediate",
-      "tags": ["FreeRTOS", "轮询", "事件驱动", "重构", "任务通信"],
-      "explanation": "《重构》Martin Fowler 在 ch3 指出第一个坏味道是「过长函数」，第二个是「重复代码」。轮询等待模式的问题在于 CPU 在 while(!flag) 中空转，既浪费功耗又阻塞其他任务。「自动化那些机械重复的工作。」——《重构》第 3 章",
-      "content": "下面展示一个典型的轮询等待模式到 FreeRTOS 事件驱动模式的重构过程。\n\n改造前：主循环每 10ms 检查一个全局标志位 flag_ready，如果为 0 就继续轮询，直到传感器数据采集完成。这种方式的问题：CPU 利用率 40%，功耗高，且在 RTOS 环境下会阻塞其他低优先级任务。更糟的是，如果传感器任务因为某些原因从未设置 flag_ready，主循环就永久卡住。\n\n改造后：传感器任务完成采集后通过 xEventGroupSetBits() 设置 EVENT_DATA_READY 位。主循环任务调用 xEventGroupWaitBits() 等待该位，超时 5000ms。如果超时，进入错误处理而非无限等待。同时使用事件组传递多个状态位（数据采集完成、校准完成、错误标志），实现一对多通知。\n\n重构步骤：第一步，定义事件位掩码（EVENT_DATA_READY = bit 0, EVENT_CALIB_DONE = bit 1, EVENT_ERROR = bit 2）；第二步，传感器任务在采集完成后调用 xEventGroupSetBits()；第三步，主循环任务用 xEventGroupWaitBits() 等待，带超时；第四步，添加超时错误处理；第五步，用队列传递实际数据（事件组只负责触发信号）。\n\n代价分析：代码量从 30 行增加到约 80 行，但主循环不再是忙等待，CPU 利用率降到 5%。新增的事件组 + 队列机制增加了约 200 字 RAM（事件组结构 8 字节 + 队列 16×12 字节），但对于 STM32F4 的 192KB RAM 来说完全可以接受。",
-      "code": "/* ===== 重构前：轮询等待（坏味道：CPU 空转） ===== */\nvolatile uint8_t g_flag_ready = 0;\n\nvoid MainLoop_Task(void *pvParameters) {\n    while (1) {\n        /* 忙等待：CPU 100% 空转直到传感器完成 */\n        while (!g_flag_ready) {\n            /* 什么问题都不做，只是浪费电力 */\n        }\n        g_flag_ready = 0;\n        Process_SensorData();\n        vTaskDelay(pdMS_TO_TICKS(100));\n    }\n}\n\n/* ===== 重构后：事件驱动（零等待 + 超时保护） ===== */\n\n#define EVENT_DATA_READY  (1 << 0)\n#define EVENT_CALIB_DONE  (1 << 1)\n#define EVENT_ERROR       (1 << 2)\n#define EVENT_ALL         (EVENT_DATA_READY | EVENT_CALIB_DONE)\n\nstatic EventGroupHandle_t xSensorEvents;\nstatic QueueHandle_t xDataQueue;\n\ntypedef struct {\n    int16_t temp_x10;\n    uint16_t hum_x2;\n    uint32_t ts_ms;\n} sensor_reading_t;\n\nvoid SensorProducer_Task(void *pvParameters) {\n    sensor_reading_t reading;\n    while (1) {\n        Read_Sensors(&reading);          /* 阻塞式读取传感器 */\n        xQueueSend(xDataQueue, &reading, pdMS_TO_TICKS(100));\n        xEventGroupSetBits(xSensorEvents,\n                           EVENT_DATA_READY);\n        vTaskDelay(pdMS_TO_TICKS(1000));\n    }\n}\n\nvoid MainLoop_EventDriven_Task(void *pvParameters) {\n    sensor_reading_t reading;\n    while (1) {\n        /* 等待数据就绪，超时 5000ms */\n        EventBits_t bits = xEventGroupWaitBits(\n            xSensorEvents,\n            EVENT_DATA_READY,\n            pdTRUE,   /* 自动清除已设置的位 */\n            pdFALSE,  /* 等待所有位（OR 语义）*/\n            pdMS_TO_TICKS(5000));\n        \n        if (bits & EVENT_DATA_READY) {\n            /* 有数据可用，从队列取出 */\n            if (xQueueReceive(xDataQueue, &reading,\n                              pdMS_TO_TICKS(100)) == pdPASS) {\n                Control_Update(reading.temp_x10,\n                               reading.hum_x2);\n            }\n        } else {\n            /* 超时：传感器可能故障，进入安全模式 */\n            Enter_Safe_Mode();\n            Log_Error(\"Sensor timeout\");\n        }\n    }\n}",
-      "pitfalls": [
-        "陷阱1：xEventGroupWaitBits 的 xClearOnExit 参数设为 pdFALSE → 症状：事件位不会被自动清除，下次 WaitBits 立即返回，导致重复处理同一份数据 → 修复：数据消费后设 pdTRUE 自动清除，通知型事件可设 pdFALSE",
-        "陷阱2：事件组和队列的使用顺序颠倒 → 症状：事件组先设置，但队列还没发送数据，主循环收到事件后从队列接收超时 → 修复：先 xQueueSend 发送数据，再 xEventGroupSetBits 设置事件，确保事件到达时数据已在队列中",
-        "陷阱3：超时时间设置过短 → 症状：传感器读取本身需要 100ms，但 WaitBits 超时只设 10ms，导致频繁进入错误处理 → 修复：超时时间应大于最慢生产者的周期，建议 = 生产者周期 × 2，本例中至少 2000ms",
-        "陷阱4：重构后忘记初始化事件组和队列 → 症状：xEventGroupSetBits 和 xQueueSend 返回 NULL 指针错误或崩溃 → 修复：在任务创建之前调用 xEventGroupCreate() 和 xQueueCreate()"
-      ],
-      "refBook": [
-        "《重构》ch3 — 搬移逻辑：将等待逻辑从主循环移到事件驱动机制",
-        "《UNIX编程艺术》ch5 — 设计原则：让程序做一件事并做好，等待交给操作系统",
-        "《代码大全》ch18 — 程序片区的组织：分离初始化、运行、回调"
-      ]
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "pattern",
+      "difficulty": "advanced",
+      "tags": ["低功耗", "策略模式", "重构", "电源管理"],
+      "explanation": "将电源管理从散乱的 if-else 和硬编码寄存器操作，重构为基于策略注册表的架构，使得新增睡眠模式只需添加回调函数而非修改核心逻辑。「每一个坏味道都是一个改进的信号。」——《重构》ch2",
+      "content": "改进前：main.c 里有 80 行散落的睡眠控制代码，每个场景（按键超时、传感器轮询间隔、充电状态）都有自己一套进睡眠/唤醒的逻辑。改进后：提取 power_manager 模块，用策略模式封装 pre_enter 和 post_wakeup 回调。代价是增加了约 40 行框架代码和一个策略注册表，但换来的是新增睡眠场景只需 10 行回调函数，且所有时钟门控和标志清除统一在核心函数中处理。",
+      "code": "```c\n/* === 改进前：散落在 main.c 中的睡眠逻辑 === */\n\nvoid check_sleep_condition(void)\n{\n    if (no_activity > 300) {\n        __HAL_RCC_ADC_CLK_DISABLE();\n        __HAL_PWR_CLEAR_WUF_FLAG();\n        HAL_PWR_EnterSTOPMode(\n            PWR_LOWPOWERREGULATOR_ON,\n            PWR_STOPENTRY_WFI);\n        /* 唤醒后恢复 */\n        SystemClock_Config();\n        I2C1_Init();\n        __HAL_PWR_CLEAR_WUF_FLAG();\n    } else if (battery_low && !charging) {\n        __HAL_RCC_GPIOB_CLK_DISABLE();\n        __HAL_RCC_ADC_CLK_DISABLE();\n        __HAL_PWR_CLEAR_WUF_FLAG();\n        /* 进 STANDBY */\n        PWR->CR |= PWR_CR_PDDS;\n        NVIC->SysTick_CTRL = 0;\n        HAL_PWR_EnterSTANDBYMode();\n    }\n}\n\n/* === 改进后：策略模式封装 === */\n\ntypedef struct {\n    const char *name;\n    uint8_t max_depth;  /* 0=SLEEP, 1=STOP2, 2=STANDBY */\n    void (*pre_enter)(void);\n    void (*post_wakeup)(void);\n} power_strategy_t;\n\nstatic power_strategy_t strategies[4];\nstatic uint8_t strategy_count = 0;\n\nuint8_t power_register_strategy(\n    power_strategy_t *s)\n{\n    if (strategy_count >= 4) return 1;\n    strategies[strategy_count++] = *s;\n    return 0;\n}\n\nvoid power_manager_select_and_enter(\n    uint8_t depth)\n{\n    /* 找到最深可用且不超 depth 的策略 */\n    for (int i = strategy_count - 1; i >= 0; i--) {\n        if (strategies[i].max_depth <= depth) {\n            __HAL_PWR_CLEAR_WUF_FLAG();\n            if (strategies[i].pre_enter)\n                strategies[i].pre_enter();\n            /* 核心函数统一处理 HAL 调用 */\n            _power_enter_mode(strategies[i].max_depth);\n            if (strategies[i].post_wakeup)\n                strategies[i].post_wakeup();\n            return;\n        }\n    }\n}\n\n/* 注册具体场景策略 */\nstatic void btn_timeout_pre(void)\n{\n    __HAL_RCC_ADC_CLK_DISABLE();\n}\nstatic void btn_timeout_post(void)\n{\n    SystemClock_Config();\n    I2C1_Init();\n}\n\npower_strategy_t btn_strategy = {\n    .name = \"btn_timeout\",\n    .max_depth = 1,  /* STOP2 */\n    .pre_enter = btn_timeout_pre,\n    .post_wakeup = btn_timeout_post\n};\n```\n\n改了什么：把散落的 HAL_PWR_EnterSTOPMode 和时钟门控调用抽入策略回调，核心函数 power_manager_select_and_enter 只做一件事——选最深安全模式并执行对应策略。为什么这样改：避免每个场景重复写相同的清除标志和时钟恢复代码，减少遗漏风险。代价：增加了策略注册表和间接调用开销（约 2us），以及 40 行框架代码，但对于超过 3 个睡眠场景的项目来说已经回本。"
     }
   ]
 }
