@@ -1,6 +1,7 @@
 {
-  "latest": "2026-05-05",
+  "latest": "2026-07-23",
   "files": [
+    "daily/2026-07-23-architecture-principle.md",
     "daily/2026-05-05.json",
     "daily/2026-07-20-architecture-principle.md",
     "daily/2026-07-18-deep-read.md",
@@ -17,8 +18,10 @@
     "daily/2026-05-02.json"
   ],
   "dates": {
+    "2026-07-23": "daily/2026-07-23-architecture-principle.md",
+    "2026-05-05": "daily/2026-05-05.json",
     "2026-07-20": "daily/2026-07-20-architecture-principle.md",
-    "2026-07-18": "daily/2026-07-18-architecture-principle.md",
+    "2026-07-18": "daily/2026-07-18-deep-read.md",
     "2026-07-17": "daily/2026-07-17-deep-read.md",
     "2026-07-15": "daily/2026-07-15-deep-read.md",
     "2026-07-14": "daily/2026-07-14-refactor-tip.md",
@@ -28,7 +31,6 @@
     "2026-06-03": "daily/2026-06-03.json",
     "2026-05-04": "daily/2026-05-04.json",
     "2026-05-03": "daily/2026-05-03.json",
-    "2026-05-02": "daily/2026-05-02.json",
-    "2026-05-05": "daily/2026-05-05.json"
+    "2026-05-02": "daily/2026-05-02.json"
   }
 }
