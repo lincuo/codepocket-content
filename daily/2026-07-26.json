@@ -1,0 +1,102 @@
+{
+  "date": "2026-07-26",
+  "topic": "DMA + 循环缓冲区的正确姿势",
+  "items": [
+    {
+      "id": "2026-07-26-dma-architecture",
+      "title": "环形缓冲区不是数据结构，是契约",
+      "topic": "DMA环形缓冲区",
+      "mode": "architecture",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "pattern",
+      "difficulty": "intermediate",
+      "tags": ["DMA", "ring-buffer", "ADT", "生产者消费者"],
+      "explanation": "环形缓冲区的核心不是指针算术，而是明确 ISR 和任务各自能读什么、能写什么。《C语言接口与实现》中 David Schmidt 把这种设计称为抽象数据类型（ADT）——接口定义了所有可能的操作，实现隐藏了内部状态。在嵌入式里，这个 ADT 的接口就是 head/tail 指针和 count，实现就是环形缓冲区的内存布局。一旦接口确定了，ISR 只改 head，任务只改 tail 和 tail+count，双方互不越界。「接口是模块对外的全部，实现是模块对自己的全部。二者之间的墙越厚，系统越不容易崩塌。」——《C语言接口与实现》第3章",
+      "content": "环形缓冲区在嵌入式系统中扮演的角色，本质上是一个**有界缓冲区（bounded buffer）**——这是操作系统教材里的经典生产者-消费者问题在硬件层面的映射。DMA 作为生产者以固定速率写入数据，CPU 作为消费者以可变速率读取数据。核心约束是：缓冲区大小必须大于等于最大处理延迟 × 数据速率。\n\n从架构角度看，环形缓冲区应该被视作一个 ADT（抽象数据类型），而非简单的内存数组。《C语言接口与实现》中明确提出：ADT 的价值不在于封装数据，而在于**限制操作集合**——只有 init、push、pop、count、empty、full 这六个操作是允许的，任何绕过这些操作的直接内存访问都是对抽象的破坏。\n\n三层架构模式将这种思想落地为三个限界上下文：\n\n1. **DMA 搬运层**：HAL 回调函数中更新 head 指针。这一层唯一的职责是把 DMA 传输完成的字节数转化为 head 的步进。它不解析数据、不判断内容、不做任何业务逻辑。关键动作是在更新 head 前调用 `__DSB()` 确保 Cortex-M7 的 Cache 一致性。\n\n2. **缓冲区管理层**：提供 `ringbuf_available()`、`ringbuf_read()`、`ringbuf_peek()` 三个接口。这一层负责溢出检测——当 `(head - tail) & RING_MASK > SIZE / 2` 时判定溢出，因为环形缓冲区只能区分空和满两种状态，当读写指针相距超过一半时，说明生产者跑得太快，必须丢弃旧数据。\n\n3. **协议解析层**：从缓冲区取数据并解析协议帧。这一层可以阻塞、可以重试、可以丢包，完全由业务策略决定，不影响底层数据流。\n\n这种分层的优点非常明显：新增一种协议解析只需要在第三层加一个分支，第二层和第一层零改动。代价是引入了额外的函数调用开销和数据拷贝——每一层都会经过一次 memcpy 或指针偏移读取。在 115200 波特率下，每秒约 11KB 的数据流过三层，memcpy 的开销约 2-3% CPU 时间，完全可接受。但如果波特率提升到 4Mbps（如 UART 高波特率模式或 SPI 高速采集），这个拷贝开销就需要用零拷贝（zero-copy）方式优化：让协议解析层直接指向缓冲区内的有效数据段，解析完再推进 tail。\n\n《UNIX编程艺术》中 Eric Raymond 提出的管道和过滤器模式与此异曲同工：每个模块只做一件事，模块之间通过有界的通道通信。环形缓冲区就是这个通道——它有明确的容量上限、明确的读写语义、明确的溢出行为。好的架构不是没有复杂度，而是把复杂度关进了笼子。\n\n**今日思考题**：如果你的环形缓冲区大小是 512 字节，DMA 以 1Mbps 速率写入（约 125KB/s），而任务每 10ms 才处理一次数据（每次最多读 50 字节），请问缓冲区会在多长时间后溢出？溢出时 head 和 tail 的关系是什么？",
+      "code": "/* 环形缓冲区 ADT 接口定义 */\ntypedef struct {\n    uint8_t *buf;          /* 指向分配好的内存 */\n    volatile uint16_t head; /* ISR 更新：写入位置 */\n    uint16_t tail;         /* 任务更新：读取位置 */\n    uint16_t size;         /* 缓冲区大小（2的幂次方）*/\n    uint16_t mask;         /* size - 1，用于位运算取模 */\n    uint8_t overflow;      /* 溢出标志 */\n} ringbuf_t;\n\nvoid ringbuf_init(ringbuf_t *rb, uint8_t *mem, uint16_t sz);\nuint16_t ringbuf_available(const ringbuf_t *rb);\nint ringbuf_push(ringbuf_t *rb, uint8_t byte);\nint ringbuf_pop(ringbuf_t *rb, uint8_t *byte);\nuint8_t ringbuf_peek(const ringbuf_t *rb, uint16_t offset);",
+      "pitfalls": [],
+      "refBook": [
+        "《C语言接口与实现》ch3",
+        "《UNIX编程艺术》ch10"
+      ]
+    },
+    {
+      "id": "2026-07-26-dma-snippet",
+      "title": "DMA 半传输/全传输中断的双缓冲处理",
+      "topic": "DMA环形缓冲区",
+      "mode": "snippet",
+      "language": "C",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "pattern",
+      "difficulty": "intermediate",
+      "tags": ["DMA", "HAL", "双缓冲", "USART"],
+      "explanation": "HAL 库的 DMA 回调函数在传输完成和半传输时都会被调用，关键是清除正确的标志位并重启 DMA 接收。《代码大全》中强调防御性编程：每个中断入口都要做参数校验和状态检查。「防御性编程的核心不是信任代码，而是信任硬件可能会做任何事。」——《代码大全》第5章",
+      "content": "双缓冲策略是 DMA 环形缓冲区的高阶用法。利用 STM32 DMA 的半传输（HT）和全传输（TC）两个中断事件，将缓冲区分成两半轮流填充，实现流水线并行处理。\n\n假设缓冲区大小为 512 字节（2^9），DMA 配置为 Circular 模式。当 DMA 写到第 256 字节时触发 HT 中断，此时前半部分数据已就绪，CPU 可以在后台处理前半部分数据，同时 DMA 继续填充后半部分。当 DMA 完成一整圈（512 字节）时触发 TC 中断，后半部分数据就绪，CPU 切换到处理后半部分。\n\n关键实现要点：\n- HT 中断和 TC 中断共用同一个回调函数 `HAL_UART_RxCpltCallback()`，通过检查 `huart->hdmarx->Instance->CR` 中的 HTIE 和 TCIE 位来判断触发了哪个事件\n- 或者更可靠的方式：在 HAL 库的 `DMA_IRQHandler` 中，通过 `__HAL_DMA_GET_HT_FLAG_INSTANCE()` 和 `__HAL_DMA_GET_TC_FLAG_INSTANCE()` 宏来区分\n- 更新 head 指针时必须用 `__DSB()` 屏障确保 DMA 写入可见\n- 回调函数内禁止做耗时操作（printf、复杂计算），只做 head 步进和标志更新\n\n以下代码展示了一个完整的 USART1 + DMA2 环形缓冲区实现，包含 HT/TC 双中断处理和 head 更新逻辑。",
+      "code": "/* 环形缓冲区定义 —— 512 字节，2 的幂次方 */\n#define RING_SIZE     512u\n#define RING_MASK     (RING_SIZE - 1u)\n\nstatic uint8_t rx_ring[RING_SIZE];\nstatic volatile uint16_t rx_head = 0u;\nstatic uint16_t rx_tail = 0u;\n\n/* 初始化 DMA + 环形缓冲区 */\nvoid uart_dma_init(void) {\n    /* 清零缓冲区 */\n    memset(rx_ring, 0, RING_SIZE);\n    rx_head = 0u;\n    rx_tail = 0u;\n    /* 启动 DMA 循环接收，HAL 内部配置 DMA2_Stream2 */\n    HAL_UART_Receive_DMA(&huart1,\n                         rx_ring,\n                         RING_SIZE);\n}\n\n/* DMA 传输完成回调 —— HT 和 TC 都走这里 */\nvoid HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {\n    if (huart->Instance == USART1) {\n        __DSB();  /* 确保 DMA 写入对所有核心可见 */\n        rx_head = (rx_head + 1u) & RING_MASK;  /* 步进更新 */\n        /* 重启 DMA 接收，Circular 模式下非必需但推荐 */\n        HAL_UART_Receive_DMA(&huart1,\n                             rx_ring,\n                             RING_SIZE);\n    }\n}\n\n/* 任务中读取可用数据 */\nvoid task_process_uart(void) {\n    uint16_t avail;\n    uint8_t byte;\n    /* 快照 head 和 tail，避免循环中被 ISR 修改 */\n    do {\n        avail = (rx_head >= rx_tail)\n                ? (rx_head - rx_tail)\n                : (RING_SIZE - rx_tail + rx_head);\n    } while (avail != 0u &&\n             (rx_head - rx_tail) != avail);\n    /* 有数据则逐个读出 */\n    while (avail-- > 0u) {\n        if (HAL_UART_Receive(&huart1, &byte, 1u,\n                             HAL_MAX_DELAY)\n            == HAL_OK) {\n            process_byte(byte);\n        }\n    }\n}",
+      "pitfalls": [
+        "陷阱1：在 HAL_UART_RxCpltCallback 中调用 printf → 症状：系统死锁，因为 printf 内部可能加锁，而 ISR 优先级高于解锁任务 → 修复：ISR 中只做 head 步进，数据处理放到任务层",
+        "陷阱2：DMA 回调中没有调用 __DSB() → 症状：Cortex-M7 上读到 stale 数据，因为 Data Cache 未刷新 → 修复：更新 head 前必须调用 __DSB()",
+        "陷阱3：用 CNDTR 寄存器计算已传输字节数 → 症状：Circular 模式下 CNDTR 从 1 重载为 SIZE 的瞬间读到异常值导致 head 回退 → 修复：用步进方式更新 head，不读硬件寄存器"
+      ],
+      "refBook": [
+        "《代码大全》ch5",
+        "《C陷阱与缺陷》ch5"
+      ]
+    },
+    {
+      "id": "2026-07-26-dma-tip",
+      "title": "DMA 环形缓冲区七大致命陷阱",
+      "topic": "DMA环形缓冲区",
+      "mode": "tip",
+      "language": "C",
+      "platform": "STM32HAL",
+      "toolchain": "HAL",
+      "snippetType": "note",
+      "difficulty": "advanced",
+      "tags": ["DMA", "环形缓冲区", "竞态条件", "Cache一致性"],
+      "explanation": "嵌入式系统的 bug 往往不是逻辑错误，而是对硬件行为的错误假设。《人月神话》中 Brooks 指出：「向进度落后的项目增加人手，只会让进度更加落后。」在 DMA 缓冲区问题上也是如此——你以为多加几个 volatile 和 DSB 就能解决所有问题，但实际上每个新增的同步点都可能引入新的竞态窗口。「计划再计划——每个估计都要加倍，因为总会发现你遗漏了什么。」——《人月神话》第9章",
+      "content": "以下是 DMA 环形缓冲区在实际项目中踩过的七个坑，按严重程度排序：\n\n**陷阱 1：volatile 只加了变量声明，没加内存屏障**\n触发条件：Cortex-M7 核启用 Data Cache（默认开启），DMA 写入缓冲区后任务读取。\n症状：程序前几秒正常，运行一段时间后读到乱码或旧数据。用逻辑分析仪抓总线发现 DMA 确实写入了正确数据，但 CPU 从 Cache 中读到的是过期值。\n修复：更新 head 之前调用 `__DSB()`（Data Synchronization Barrier），确保 DMA 写入的内存对所有核心可见。如果是 M7 核，还需要在读取前调用 `SCB_CleanDCache_by_Addr(buf, SIZE, 8)` 清理 Cache Line。\n\n**陷阱 2：缓冲区大小不是 2 的幂次方**\n触发条件：为了方便人类阅读，把缓冲区大小设为 256 以外的值（比如 200、500）。\n症状：写入后读取出乱码，或者 HardFault。因为位运算掩码 `(ptr + 1) & (size - 1)` 在非 2 的幂次方时计算错误。\n修复：init 时断言 `assert((sz & (sz - 1)) == 0)`，强制要求 2 的幂次方。如果硬件限制必须非 2 的幂次方，改用 `%` 取模运算，但性能会下降 3-5 倍。\n\n**陷阱 3：任务层 while(avail > 0) 循环中 head 被 ISR 更新导致死循环**\n触发条件：高波特率（>1Mbps）下，数据持续流入，任务处理速度慢于 DMA 写入速度。\n症状：任务进入 while 循环后永远出不来，CPU 占用率 100%，其他任务饿死。因为循环条件 `avail` 在每次迭代时被重新计算，ISR 不断推进 head，avail 永远不为 0。\n修复：在进入循环前做一次快照——把 head 和 tail 读到局部变量，循环中使用快照值计算剩余数量。或者在循环体内加一个最大处理数量上限（比如每次最多处理 64 字节），防止饥饿。\n\n**陷阱 4：DMA 缓冲区地址未按 Cache Line 对齐**\n触发条件：Cortex-M7 核，缓冲区用普通 `uint8_t buf[512]` 声明。\n症状：DMA 写入的数据在核心侧读取时出现随机字节错位，仅 M7 核出现，M4/M3 正常。反汇编发现 DMA 写入的地址和 CPU 读取的地址相差 4 字节。\n修复：声明缓冲区时使用 `__attribute__((aligned(32)))`（M7 Cache Line 为 32 字节），并在 DMA 传输完成后调用 `SCB_CleanDCache_by_Addr(buf, SIZE, 8)` 清理对应的 Cache Line。\n\n**陷阱 5：中断优先级设置错误导致 DMA 数据被覆盖**\n触发条件：DMA 中断优先级设得比处理任务的优先级高（NVIC 数字越小优先级越高，比如 DMA 设为 0，任务在 osKernelSched 中优先级为 5）。\n症状：高波特率下偶尔丢包。DMA 中断频繁抢占任务，导致任务来不及推进 tail，缓冲区溢出但溢出标志未被正确处理。\n修复：DMA 中断优先级设为较低值（较大数字），处理任务的优先级设为较高值（较小数字）。确保任务有足够的时间片推进 tail，避免缓冲区溢出。\n\n**陷阱 6：Single 模式和 Circular 模式混用**\n触发条件：在 TC 中断回调中手动重启 DMA 接收（`HAL_UART_Receive_DMA`），但 DMA 配置为 Circular 模式。\n症状：第一次传输正常，第二次传输数据错位。因为 Circular 模式下 DMA 自动循环，手动重启会导致 CNDTR 寄存器重复加载，DMA 从缓冲区中间位置开始写入。\n修复：Circular 模式下不需要在回调中重启 DMA，HAL 库会自动继续。只有在 Single 模式下才需要在 TC 回调中重新调用 `HAL_UART_Receive_DMA`。\n\n**陷阱 7：溢出检测逻辑错误——用减法判断而不是位运算**\n触发条件：缓冲区接近满时，head 绕回 0，tail 还在高位地址。\n症状：`avail = head - tail` 得到负数（溢出），导致 while 循环条件判断错误，要么漏读数据要么读到未初始化的内存。\n修复：始终使用位运算计算可用量：`avail = (head - tail) & RING_MASK`。但要注意，这种方式无法区分「缓冲区为空」和「缓冲区已满」——两者都返回 0。所以需要用额外的 overflow 标志或 count 计数器来辅助判断。",
+      "code": "/* 快照模式 —— 避免 ISR 在循环中修改 head 导致死锁 */\nstatic inline uint16_t ringbuf_snapshot_available(\n    const volatile uint16_t *head,\n    const uint16_t *tail,\n    uint16_t mask)\n{\n    uint16_t h = *head;  /* volatile read */\n    uint16_t t = *tail;\n    return (h >= t) ? (h - t) : (mask + 1u - t + h);\n}\n\n/* 安全读取循环 —— 使用快照值 */\nvoid safe_read_loop(void) {\n    uint16_t avail = ringbuf_snapshot_available(\n                        &rx_head, &rx_tail,\n                        RING_MASK);\n    /* 限制单次最大处理量，防止饥饿 */\n    if (avail > 256u) avail = 256u;\n    while (avail-- > 0u) {\n        uint8_t b = rx_ring[rx_tail];\n        rx_tail = (rx_tail + 1u) & RING_MASK;\n        process_byte(b);\n    }\n}",
+      "pitfalls": [
+        "陷阱1：Cortex-M7 上 volatile 不够，缺少 __DSB() 和 Cache Clean → 症状：运行时读到 stale 数据 → 修复：更新 head 前调用 __DSB()，M7 额外调用 SCB_CleanDCache_by_Addr()",
+        "陷阱2：缓冲区大小非 2 的幂次方仍用位运算掩码 → 症状：写入后读取出乱码 → 修复：init 时断言 (sz & (sz-1))==0，或用 % 取模替代 &",
+        "陷阱3：while(avail>0) 循环中不做快照 → 症状：高波特率下任务死锁，CPU 100% → 修复：先快照 head/tail 到局部变量，循环用快照值，且限制单次最大处理量",
+        "陷阱4：Circular 模式下在回调中重启 DMA → 症状：第二次传输数据错位 → 修复：Circular 模式不需要重启，Single 模式才需要",
+        "陷阱5：溢出检测用 head-tail 减法无掩码 → 症状：head 绕回 0 后得到负数 → 修复：始终用 (head - tail) & RING_MASK，配合 overflow 标志区分空和满"
+      ],
+      "refBook": [
+        "《人月神话》ch9",
+        "《C陷阱与缺陷》ch5",
+        "《代码大全》ch5"
+      ]
+    },
+    {
+      "id": "2026-07-26-dma-refactor",
+      "title": "从裸指针到 ADT：环形缓冲区的重构之路",
+      "topic": "DMA环形缓冲区",
+      "mode": "refactor",
+      "language": "C",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
+      "snippetType": "pattern",
+      "difficulty": "intermediate",
+      "tags": ["重构", "ADT", "信息隐藏", "环形缓冲区"],
+      "explanation": "Martin Fowler 在《重构》中指出，代码坏味道中的「散落的特性（Specialist Pleasure）」——即多个地方直接操作相同数据结构的不同字段——是模块耦合过深的信号。将 DMA head/tail 的直接访问封装为 ringbuf_push/pop/count 接口后，ISR 和任务都不再知道缓冲区的内部布局。「任何傻瓜都能写出计算机理解的代码。好的程序员写人能理解的代码。」——《重构》第2版序言",
+      "content": "下面展示一个典型的 DMA 环形缓冲区从「裸指针操作」到「ADT 封装」的重构过程。\n\n**重构前的坏味道**：\n- ISR 中直接操作 `rx_buf[rx_head++]`，主循环中直接访问 `rx_buf[rx_tail++]`\n- 溢出检测逻辑散落在 ISR 和主循环两处\n- 缓冲区大小硬编码在多个文件中\n- 任何新增的 DMA 外设都需要复制一份同样的头尾指针和溢出检测代码\n\n**重构后的改进**：\n- 所有缓冲区操作通过 `ringbuf_t` 结构体的接口函数完成\n- 溢出检测集中在 `ringbuf_push` 内部\n- 缓冲区大小在 init 时一次性传入\n- 新增 DMA 外设只需分配一个新的 `ringbuf_t` 实例\n\n代价分析：\n- 代码量增加了约 40%（从 ~60 行到 ~85 行），但可维护性显著提升\n- 每次 push/pop 增加了一次函数调用开销（Thumb-2 下 inline 后可消除）\n- 缓冲区控制块增加了 16 字节（6 个 uint16_t/volatile uint16_t + 1 个指针 + 1 个 overflow 标志）\n\n对于只有一个 DMA 外设的小项目，这个重构可能显得过度工程化。但按照《UNIX编程艺术》的模块原则：「系统应该从一个可以工作的原型开始，但每一步都要朝着模块化方向前进。」如果你确定这个项目这辈子只有一个串口用 DMA，那直接裸指针操作也没问题。但如果你在做一个多传感器 IoT 网关，五个外设都在用 DMA 采集数据，那么 ADT 封装的价值会在第三次复制粘贴时显现出来。\n\nRule of Three 在嵌入式里不是建议，是纪律。",
+      "code": "/* ===== 重构前：裸指针操作 ===== */\n/* ❌ ISR 中直接操作 */\nvoid DMA1_Channel4_IRQHandler(void) {\n    static uint16_t h = 0;\n    if (__HAL_DMA_GET_FLAG(&hdma, ...)) {\n        __DSB();\n        rx_buf[h++] = DMA_ReadData();  /* 裸写 */\n        if (h >= 512) h = 0;            /* 硬编码绕回 */\n    }\n}\n\n/* ❌ 主循环中也直接操作 */\nvoid main_loop(void) {\n    static uint16_t t = 0;\n    while (t != h) {               /* 裸比较 */\n        process(rx_buf[t++]);      /* 裸读取 */\n        if (t >= 512) t = 0;       /* 硬编码绕回 */\n    }\n}\n\n/* ===== 重构后：ADT 封装 ===== */\n/* ✅ 统一的环形缓冲区接口 */\ntypedef struct {\n    uint8_t *buf;\n    volatile uint16_t head;\n    uint16_t tail;\n    uint16_t size;\n    uint16_t mask;\n    uint8_t overflow;\n} ringbuf_t;\n\nstatic inline void ringbuf_init(\n    ringbuf_t *rb, uint8_t *mem,\n    uint16_t sz) {\n    rb->buf = mem;\n    rb->head = 0;\n    rb->tail = 0;\n    rb->size = sz;\n    rb->mask = sz - 1u;\n    rb->overflow = 0;\n}\n\nstatic inline int ringbuf_push(\n    ringbuf_t *rb, uint8_t byte) {\n    uint16_t next = (rb->head + 1u)\n                    & rb->mask;\n    if (next == rb->tail) {        /* 满 */\n        rb->overflow = 1;\n        return -1;\n    }\n    rb->buf[rb->head] = byte;\n    rb->head = next;\n    return 0;\n}\n\nstatic inline int ringbuf_pop(\n    ringbuf_t *rb, uint8_t *out) {\n    if (rb->head == rb->tail)      /* 空 */\n        return -1;\n    *out = rb->buf[rb->tail];\n    rb->tail = (rb->tail + 1u)\n               & rb->mask;\n    return 0;\n}\n\n/* ✅ ISR 中只用 push */\nvoid DMA_Handler(void) {\n    __DSB();\n    ringbuf_push(&uart1_rb,\n                 DMA_ReadData());\n}\n\n/* ✅ 主循环中只用 pop */\nvoid main_loop(void) {\n    uint8_t b;\n    while (ringbuf_pop(&uart1_rb,\n                       &b) == 0) {\n        process_byte(b);\n    }\n}",
+      "pitfalls": [
+        "陷阱1：inline 函数在 -O0 优化下不会内联 → 症状：每次 push/pop 产生实际函数调用开销，ISR 延迟增加 → 修复：使用 static inline 并确保编译优化级别为 -O2 或更高，编译后用 objdump 确认函数已被内联",
+        "陷阱2：ringbuf_pop 返回 -1 表示空，但返回值是 int 类型 → 症状：调用方如果用 uint8_t 接收返回值，-1 会变成 255，导致无限循环 → 修复：返回值用 int 类型，调用方用 int 接收，或改用 bool 类型返回成功/失败",
+        "陷阱3：ringbuf_init 没有断言 size 是 2 的幂次方 → 症状：mask = sz - 1 计算错误，后续位运算取模出错 → 修复：在 init 中加入 assert((sz & (sz-1)) == 0)，或在不支持 assert 的环境下用 if 检查并 panic"
+      ],
+      "refBook": [
+        "《重构》ch2",
+        "《UNIX编程艺术》ch2",
+        "《C语言接口与实现》ch3"
+      ]
+    }
+  ]
+}
