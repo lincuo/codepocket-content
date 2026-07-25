@@ -1,6 +1,7 @@
 {
   "latest": "2026-07-25",
   "files": [
+    "daily/2026-07-25-refactor-tip.md",
     "daily/2026-07-25-architecture-principle.md",
     "daily/2026-05-05.json",
     "daily/2026-07-24-architecture-principle.md",
@@ -22,7 +23,7 @@
   ],
   "dates": {
     "2026-05-05": "daily/2026-05-05.json",
-    "2026-07-25": "daily/2026-07-25-architecture-principle.md",
+    "2026-07-25": ["daily/2026-07-25-refactor-tip.md", "daily/2026-07-25-architecture-principle.md"],
     "2026-07-24": "daily/2026-07-24-architecture-principle.md",
     "2026-07-23": "daily/2026-07-23-architecture-principle.md",
     "2026-07-20": "daily/2026-07-20-architecture-principle.md",
