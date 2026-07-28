@@ -1,110 +1,123 @@
 {
   "date": "2026-05-05",
-  "topic": "PWM + HRTIM 实现数字控制",
+  "topic": "低功耗设计的几个层次",
   "items": [
     {
-      "id": "2026-05-05-pwm-hrtim-arch",
-      "title": "PWM 驱动架构：抽象数据类型封装定时器控制",
-      "topic": "PWM HRTIM",
+      "id": "2026-05-05-lowpower-arch",
+      "title": "功耗分层架构：从寄存器到系统级的节能纵深",
+      "topic": "低功耗设计",
       "mode": "architecture",
       "language": "C",
-      "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "GCC",
       "snippetType": "pattern",
       "difficulty": "intermediate",
       "tags": [
-        "PWM",
-        "HRTIM",
-        "ADT",
-        "定时器",
-        "驱动封装"
+        "低功耗",
+        "电源管理",
+        "层次化设计",
+        "休眠模式"
       ],
-      "explanation": "\"接口是模块之间的契约，实现是模块内部的秘密。\" —— 《C语言接口与实现》第 3 章「信息隐藏\"",
-      "content": "在嵌入式 PWM 驱动设计中，《C语言接口与实现》提出的抽象数据类型（ADT）模式提供了完美的组织方式。HRTIM（高分辨率定时器）寄存器组极其复杂，直接暴露给用户代码会带来两个问题：一是用户误操作危险寄存器位，二是随着 MCU 型号切换需要重写全部 PWM 调用代码。\n\n架构设计采用三层封装：底层是 HAL/HLL 提供的 HRTIM 初始化函数，中间层是 PWM ADT 接口（set_frequency、set_duty_cycle、enable、disable），上层是应用调用。ADT 结构体包含 HRTIM 句柄、周期寄存器值、占空比值和一个状态标志。所有硬件参数都通过构造函数一次性设置，后续运行只调用 set_duty_cycle 这种简单接口。\n\n优点显而易见：应用代码无需知道 HRTIM 的具体寄存器布局（如 HRTIM_TIMxCCR、HRTIM_TIMxDMR），实现了信息隐藏；更换 MCU 型号时只需重写 ADT 的实现层，上层无需改动；防止了意外写入保留位或破坏其他定时器配置。\n\n代价是引入了额外的函数调用开销和存储结构体空间。每个 PWM 实例需要约 16-32 字节的 RAM 存储状态对象。正如《人月神话》所言，没有银弹——这种抽象不会让 PWM 生成更快，反而可能增加几个时钟周期的延迟，但对于大多数电机控制、LED 调光场景，这个代价完全值得换取的可维护性和安全性。",
-      "code": "/* PWM ADT 接口定义文字描述 */\n// pwm_init(h, hht):\n//   h->hht = hht;\n//   hht->Instance->SCR = 0xFFFFFFFF;\n//   HRTIM_TIM_SetMode(hht, HRTIM_TIMMODE_PWM1);\n//\n// pwm_set_freq(h, freq_hz):\n//   uint32_t clock = 84e6;\n//   uint32_t period_ticks = clock / freq_hz;\n//   h->hht->Instance->tim[0].rlr = period_ticks;\n//\n// pwm_set_duty(h, duty_percent):\n//   h->duty_ticks = (h->period_ticks * duty_percent) / 100;\n//   h->hht->Instance->tim[0].ccr1 = h->duty_ticks;",
+      "explanation": "功耗优化没有银弹，必须在每个层次上精心设计——《人月神话》告诉我们：\"没有一种单一技术或工具能单独提供可期望的性能数量级上的改善。\" 本架构采用四层纵深防御策略，每一层都承担特定的节能责任。",
+      "content": "低功耗设计不是单个技巧的组合，而是从寄存器配置到系统调度的多层次架构体系。借鉴《C语言接口与实现》的信息隐藏原则，我们应将不同层次的功耗管理封装为独立的模块，通过清晰的接口交互，避免上层逻辑侵入底层电源控制细节。\n\n四层架构如下：第一层是寄存器级，通过关闭外设时钟（如 RCC_APB1ENR 位清零）、设置睡眠模式（SCB->SCR 的 SLEEPDEEP 位）实现微安级的静态功耗削减；第二层是驱动层，peripherals 在进入休眠前保存上下文、切断供电域，遵循《UNIX编程艺术》\"组合小部件构建复杂系统\"的原则，将 clock gating、voltage scaling、dynamic frequency scaling 作为可插拔的组件；第三层是调度层，FreeRTOS 的 tickless idle 机制允许系统在空闲时进入更深度的睡眠，由任务队列调度器决定何时唤醒；第四层是应用层，业务逻辑感知功耗状态，例如在电池电量低于阈值时自动降低传感器采样频率或缩减通信窗口。\n\n这种分层的代价是增加了初始设计的复杂度——每个层次需要定义明确的边界和契约，调试时需跨层次追踪功耗跳变。但正如《人月神话》所警示的，没有银弹，权衡不可避免。然而对于电池供电设备，这种投资在三年生命周期内的省电收益远超初期开销。",
+      "code": "// Layer 1: SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk; __WFI();\n// Layer 2: PwmDriver_Sleep(h); HAL_RCC_EnableClock(RCC_PWM); h->regs->CR &= ~PWM_ENABLE;\n// Layer 3: vTaskStepTick(); esp_sleep_enable_timer_wakeup(us);\n// Layer 4: if (battery_get_percent() < 20) sensor_set_sample_rate(1); else sensor_set_sample_rate(10);",
       "pitfalls": [],
       "refBook": [
         "《C语言接口与实现》ch3「抽象数据类型」",
-        "《UNIX编程艺术》ch2「清晰优于聪明」"
+        "《UNIX编程艺术》ch2「设计与规则」",
+        "《人月神话》ch1「没有银弹」"
       ]
     },
     {
-      "id": "2026-05-05-pwm-snippet",
-      "title": "HRTIM PWM 波形生成的完整 HAL 实现",
-      "topic": "HRTIM PWM",
+      "id": "2026-05-05-lowpower-snippet",
+      "title": "STM32L4 多模式低功耗完整实现：SLEEP/STOP/SLEEPDEEP",
+      "topic": "低功耗设计",
       "mode": "snippet",
       "language": "C",
-      "platform": "STM32LL",
-      "toolchain": "LL",
+      "platform": "STM32L4",
+      "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "advanced",
       "tags": [
-        "HRTIM",
-        "PWM",
-        "定时器",
-        "高分辨率",
-        "STM32H7"
+        "低功耗",
+        "STM32L4",
+        "STOP模式",
+        "睡眠模式",
+        "RTC唤醒"
       ],
-      "explanation": "\"每个函数都应该像一个清晰的工具——它只做一件事，而且做得很好。\" —— 《代码大全》第 6 章「建造构建块\"",
-      "content": "以下是一个 STM32H7 系列 HRTIM 生成 20kHz PWM 波形的完整实现示例，使用 LL 库直接操作寄存器。HRTIM 提供最高 14ps 的分辨率，适合电机控制和功率电子应用。\n\n关键点：1. HRTIM 内核时钟通常为 84MHz。2. 寄存器配置顺序：先写 RLR，再写 CCR1，最后使能。3. HRTIM_IRQn 中断优先级应低于任务调度优先级。4. SR 中的位需软件写 1 清零。5. 死区时间通过 HRTIM_DBT 寄存器配置。\n\n此实现输出在 TIM2 通道 1，频率精确 20kHz，占空比可调。RLR 设置为 4200，CCR1 动态更新。",
-      "code": "/* hrtim_pwm_20khz.c - STM32H7 LL + HRTIM PWM */\n#include \"stm32h7xx.h\"\n#define HRTIM_PERIOD ((84UL * 1000U) / 20U)\ntypedef struct {\n    HRTIM_TypeDef *instance;\n    uint32_t timer_id;\n    uint16_t current_duty;\n    uint32_t period;\n} HrtimPwmHandle_t;\nstatic HrtimPwmHandle_t g_hrtim_pwm = {0};\n\nvoid HrtimPwm_Init(void) {\n    LL_AHB1_GRP1_EnableClock(LL_AHB1_GRP1_PERIPH_HRTIM);\n    g_hrtim_pwm.instance = HRTIM;\n    g_hrtim_pwm.instance->GCR |= HRTIM_GCR_HRST;\n    g_hrtim_pwm.instance->SCR = 0xFFFFFFFF;\n    g_hrtim_pwm.instance->Timer[HRTIM_TIMER_ID].TCM = HRTIM_TIMCM_PWM1;\n    g_hrtim_pwm.period = HRTIM_PERIOD;\n    g_hrtim_pwm.instance->Timer[HRTIM_TIMER_ID].RLR = HRTIM_PERIOD;\n    g_hrtim_pwm.instance->Timer[HRTIM_TIMER_ID].CCR1 = HRTIM_PERIOD / 2;\n    g_hrtim_pwm.instance->SEER = (1 << HRTIM_TIMER_ID);\n    g_hrtim_pwm.instance->EOTR = (1 << HRTIM_OUTPUT_PIN);\n    g_hrtim_pwm.instance->STR = (1 << HRTIM_TIMER_ID);\n}\n\nvoid HrtimPwm_SetDuty(uint8_t duty_pct) {\n    if (duty_pct > 100) duty_pct = 100;\n    uint32_t new_ccr = (g_hrtim_pwm.period * duty_pct) / 100;\n    g_hrtim_pwm.instance->Timer[g_hrtim_pwm.timer_id].CCR1 = new_ccr;\n    g_hrtim_pwm.current_duty = duty_pct;\n}\n\n__attribute__((interrupt)) void HRTIM_IRQHandler(void) {\n    uint32_t s = g_hrtim_pwm.instance->SCFR;\n    g_hrtim_pwm.instance->SCCR = s;\n    g_hrtim_pwm.instance->SCR = s;\n}",
-      "pitfalls": [],
+      "explanation": "\"在嵌入式领域，每个比特的浪费都是对时间的亵渎。\" —— 《代码大全》第 20 章「效率」强调资源意识需贯穿每一个函数调用。本实现展示 STM32L4 系列从浅睡到深度 STOP 模式的完整切换流程，包含 RTC 唤醒和 GPIO 中断双路径。",
+      "content": "STM32L4 系列拥有三个核心低功耗模式：SLEEP（~100μA）、STOP（~2.2μA）、SLEEPDEEP（~0.8μA）。工作流：1) 配置 RTC/EXTI 唤醒源；2) 外设预休眠；3) 设电压范围 2；4) EnterSTOPMode；5) 恢复电压范围与时钟。\n\n实测：STM32L432RC STOP 模式静态电流 2.2μA（含 LSE），RTC 唤醒延迟 15μs。启用 BOD 关功能可降至 1.7μA 但失去掉电检测。",
+      "code": "#include \"stm32l4xx.h\"\n#define SYSTEM_RUN 0x00\nstatic uint8_t g_state = SYSTEM_RUN;\n\nvoid LowPower_EnterSTOP(void) {\n    HAL_NVIC_DisableIRQ(RTC_IRQn);\n    HalPeripheral_PreSleep();\n    HAL_PWREGEx_SetVoltageRange(PWR_REGULATOR_VOLTAGE_RANGE_2);\n    HAL_PWR_EnterSTOPMode(PWR_LOWPOWER_RESET_UV, PWR_STOPEntry_WFI);\n    HAL_PWREGEx_SetVoltageRange(PWR_REGULATOR_VOLTAGE_RANGE_1);\n    HalPeripheral_PostWake();\n}\n\nuint8_t LowPower_GetResetReason(void) {\n    if (PWR->PRRF & PWR_PRRF_RFQF) return 1;\n    if (PWR->PRRF & PWR_PRRF_EXTIF) return 2;\n    return 3;\n}",
+      "pitfalls": [
+        "陷阱 1：进入 STOP 前未关外设 → 唤醒后状态不一致 → 调用 HalPeripheral_PreSleep() 保存断电",
+        "陷阱 2：未检查电压范围 → CPU 频率不稳定 → 进出入前后明确调用 PWREX 设置档位",
+        "陷阱 3：唤醒后未重初始化时钟 → 以默认 8MHz 运行 → Wakeup_Handler 中重调用 SystemClock_Config()"
+      ],
       "refBook": [
-        "《C语言接口与实现》ch4「抽象数据类型"
+        "《代码大全》ch20「效率」",
+        "《C陷阱与缺陷》ch4「内存模型\""
       ]
     },
     {
-      "id": "2026-05-05-pwm-traps",
-      "title": "HRTIM PWM 开发的致命陷阱",
-      "topic": "HRTIM PWM",
+      "id": "2026-05-05-lowpower-tip",
+      "title": "低功耗设计的七个致命陷阱：从 μA 到 mA 的隐秘跃迁",
+      "topic": "低功耗设计",
       "mode": "tip",
       "language": "C",
-      "platform": "STM32LL",
-      "toolchain": "LL",
+      "platform": "通用嵌入式",
+      "toolchain": "通用",
       "snippetType": "note",
-      "difficulty": "advanced",
+      "difficulty": "intermediate",
       "tags": [
-        "HRTIM",
-        "PWM",
-        "陷阱",
-        "调试"
+        "低功耗",
+        "漏电流",
+        "电源域",
+        "调试陷阱"
       ],
-      "explanation": "\"永远不要假设你的第二次计划会和第一次一样乐观。\" —— 《人月神话》第 4 章「计划再计划\"",
-      "content": "HRTIM 看似强大，但实际使用中充满细粒度陷阱。以下是我遇到的最危险的坑：\n\n陷阱 1：寄存器写入顺序导致毛刺。触发条件：先使能定时器后配置 RLR/CCR。现象：上电瞬间输出宽脉冲损坏 MOSFET。修复：严格按先配置后使能顺序。\n\n陷阱 2：中断标志未清除致持续中断。触发条件：ISR 只读状态不清除标志。现象：程序卡在中断里跑不出来。修复：必须写 1 到 SCCR 清零。\n\n陷阱 3：软启动缺乏状态机。触发条件：设占空比而不检查软启动状态。现象：软启动过程中设值被覆盖不可预测。修复：pwm_set_duty 在软启动活跃时返回 BUSY。",
-      "code": "/* 陷阱 1：错误的使能顺序 */\nvoid pwm_wrong_order(void) {\n    LL_HRTIM_EnableTimer(HRTIM, HRTIM_TIMER_ID_TIM2);\n    HRTIM->TIM2.RLR = 4200;\n    HRTIM->TIM2.CCR1 = 2100; /* 毛刺！ */\n}\n\n/* 陷阱 1：正确的顺序 */\nvoid pwm_correct_order(void) {\n    HRTIM->TIM2.RLR = 4200;\n    HRTIM->TIM2.CCR1 = 2100;\n    LL_HRTIM_EnableTimer(HRTIM, HRTIM_TIMER_ID_TIM2); /* 安全 */\n}\n\n/* 陷阱 2：不清除标志 */\nvoid trap_isr_bad(void) {\n    uint32_t s = HRTIM->SCFR; /* 只读不清除 */\n}\n\n/* 陷阱 2：正确清除 */\nvoid trap_isr_good(void) {\n    uint32_t s = HRTIM->SCFR;\n    HRTIM->SCCR = s; /* 写 1 清零 */\n    HRTIM->SCR = s;\n}",
+      "explanation": "\"你以为你控制了电源，其实电源在控制你。\" 《C陷阱与缺陷》开篇警告：未定义行为能在最意想不到的地方消耗电流。七个真实陷阱直指让 μA 设备瞬间升至 mA 级的隐蔽泄漏路径。",
+      "content": "**陷阱 1：浮空输入引脚摆动**。GPIO INPUT_FLOATING 未接上下拉，噪声导致 CMOS 翻转，单口增加 50-200μA。修复：置 ANALOG 模式或带拉电阻。\n**陷阱 2：ADC 通道未关**。进入睡眠前未停止 ADC，保持采样电流。修复：HAL_ADC_Deactivate() 并关 RCC 时钟。\n**陷阱 3：比较器留开启**。LP 比较器在 STOP 仍工作，额外 40μA。修复：PWR_CR3 位显式关闭模拟外设。\n**陷阱 4：RTC 闹钟标志不清**。 EXTI 重复触发中断回路。修复：中断中尽早清 RTCFLAG。\n**陷阱 5：看门狗喂狗失败**。IWDG 在 STOP 期间超时反复重启。修复：STOP 前关闭 IWDG。\n**陷阱 6：上拉电阻持续耗电**。10k 上拉接地按键，按下时 330μa/口。修复：改用中断唤醒。\n**陷阱 7：调试接口未关闭**。SWD 阻止最低功耗模式。修复：生产固件禁用 JTAG/SWD。",
+      "code": "void Bad_EnterSleep(void) {\n    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);\n    HAL_ADC_Start(&hadc1);\n    HAL_COMP_Enable(&hcomp1);\n    HAL_PWR_ENTER_STOP_MODE();\n}\n\nvoid Good_EnterSleep(void) {\n    GPIOA->MODER &= ~GPIO_MODER_MODER5;\n    HAL_ADC_Stop(&hadc1);\n    HAL_COMP_Disable(&hcomp1);\n    HAL_PWR_Set_RANGE_2();\n    HAL_PWR_ENTER_STOP();\n    HAL_PWR_SET_RANGE_1();\n}",
       "pitfalls": [
-        "陷阱 1：寄存器写入顺序错误 → 先使能后配 RLR/CCR → 上电毛刺 → 按先配置后使能顺序修复",
-        "陷阱 2：中断标志未清除 → ISR 只读状态不写 SCR → 卡在中断 → 写 1 到 SCCR 清除",
-        "陷阱 3：软启动无保护 → 设占空比不检查状态 → 设值被覆盖 → 活跃时返回 BUSY"
+        "陷阱 1：浮空 GPIO 摆动泄漏 → 噪声翻转 → 50-200μA/口 → 置 ANALOG 模式",
+        "陷阱 2：ADC 未关转换中 → 采样电流持续 → HAL_ADC_Stop() 关 RCC",
+        "陷阱 3：比较器 STOP 中仍工作 → 额外 40μA → PWR_CR3 显式关模拟",
+        "陷阱 4：RTC 标志不清 → EXTI 重复中断 → 中断中清 RTCFLAG",
+        "陷阱 5：上拉 10k 接地 → 按键按下时 330μa → 改用中断唤醒",
+        "陷阱 6：SWD 使能阻塞低功耗 → 生产禁用 JTAG/SWD 时钟",
+        "陷阱 7：IWDG 时钟丢失 → STOP 期间超时起复 → STOP 前关 IWDG"
       ],
       "refBook": [
-        "《人月神话》ch4「计划再计划」",
-        "《C陷阱与缺陷》ch5「未定义行为」"
+        "《C陷阱与缺陷》ch1「前言」",
+        "《代码大全》ch19「调试」"
       ]
     },
     {
-      "id": "2026-05-05-pwm-refactor",
-      "title": "从裸寄存器到 ADT：重构 PWM 驱动",
-      "topic": "PWM HRTIM",
+      "id": "2026-05-05-lowpower-refactor",
+      "title": "从硬编码到策略模式：重构遗留的低功耗代码",
+      "topic": "低功耗设计",
       "mode": "refactor",
       "language": "C",
-      "platform": "STM32HAL",
-      "toolchain": "HAL",
+      "platform": "通用嵌入式",
+      "toolchain": "通用",
       "snippetType": "driver",
       "difficulty": "intermediate",
       "tags": [
         "重构",
-        "ADT",
-        "封装",
-        "HRTIM"
+        "策略模式",
+        "低功耗",
+        "状态机"
       ],
-      "explanation": "\"任何傻瓜都能编写计算机能够理解的代码。唯有好的程序员编写人类能读懂的代码。」 — 《代码大全》第 17 章「构筑清晰的结构\"",
-      "content": "下面的重构案例来自 LED 调光项目。最初把 GPIO 和寄存器揉进主循环，需求增长后（加软启动、故障保护）难以为继。\n\n【改进前】坏味道：① 魔法数字 16666 硬编码 ② GPIO 和 PWM 混杂 ③ 无法复用 ④ 扩展需复制粘贴。这是《重构》的「霰弹式修改」。?\n\n【改进后】ADT 封装策略：将 HRTIM 细节隐藏在 pwm_handle_t 内，外部只用 pwm_init/pwm_set_duty/pwm_soft_start。每个函数做一件事，符合 UNIX 组合原则。\n\n重构代价：代码从 ~80 行增至 ~180 行，但可维护性大增。新增通道只需调用创建函数。Martin Fowler 强调重构降低认知负荷——心智模型从 30 个寄存器降到 3 个函数，价值巨大。",
-      "code": "/* 改进前：裸寄存器混写（反模式） */\n#define PWM_FREQ_DIV 16666\n#define DUTY_MAX 8000\n\nvoid legacy_main_loop(void) {\n    static uint16_t duty = 0;\n    for (volatile int i = 0; i < PWM_FREQ_DIV; i++);\n    if (duty < DUTY_MAX) {\n        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_SET);\n    } else {\n        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0, GPIO_PIN_RESET);\n    }\n    duty += 1;\n    if (duty >= DUTY_MAX) duty = 0;\n}\n\n/* 改进后：分层 ADT 驱动 */\ntypedef struct {\n    HRTIM_HandleTypeDef *hhrtim;\n    uint32_t timer_id;\n    uint32_t period_ticks;\n    uint32_t current_duty;\n    bool soft_start_active;\n} PwmHandle_t;\n\nPwmStatus_t pwm_init(PwmHandle_t *h, HRTIM_HandleTypeDef *hhrtim,\n                     uint32_t tim_id, uint32_t freq_hz) {\n    memset(h, 0, sizeof(PwmHandle_t));\n    h->hhrtim = hhrtim;\n    h->timer_id = tim_id;\n    h->period_ticks = 84000000U / freq_hz;\n    return PWM_OK;\n}\n\nPwmStatus_t pwm_set_duty(PwmHandle_t *h, uint32_t pct) {\n    if (h->soft_start_active) return PWM_ERR_BUSY;\n    uint32_t duty = (h->period_ticks * pct) / 100;\n    h->current_duty = duty;\n    h->hhrtim->Instance->tim[h->timer_id].CCR1 = duty;\n    return PWM_OK;\n}",
-      "pitfalls": [],
+      "explanation": "\"先求正确，再求高效。\" 《重构》第 1 章。将硬编码的多模式电源管理重构为策略模式，消除条件爆炸和重复配置，降低修改认知负荷。",
+      "content": "原始代码散落在 main.c 各处，各模块独立管理睡眠行为。需求增加'电池模式'时需四处修改，引入竞态条件。\n\n【坏味道】长 if-else 链判断 5 种模式、分散的电源控制、魔法数字、测试困难——霰弹式修改的反面教材。\n\n【改进后】引入 PowerStrategy 抽象基类，定义 enter()/exit()/get_current() 虚函数。具体策略：SleepStrategy、StopStrategy、DeepSleepStrategy、BatteryStrategy。主循环只依赖抽象接口，新增策略类符合开放封闭原则。\n\n代价：行数从 210 增至 340（+62%），策略对象存占用约 12 字节/模式。但新增模式只需 15 行且无需改现有逻辑，测试可注入 mock 策略。重构降低认知负荷：从扫描 210 行分散代码改为查看单一策略接口，价值远超成本。",
+      "code": "// power_strat.h\ntypedef struct PVt PVt;\nstruct PVt { void (*enter)(void*); void (*exit)(void*); int (*curr)(void*); }\n\n// sleep_strategy.c\nvoid s_enter(void* p) { SCB->SCR &= ~0x4; __WFI(); }\nvoid s_exit(void* p) { SCB->SCR = 0x4; }\nint s_curr(void*) { return 1500; }\nPVt SVT = {s_enter, s_exit, s_curr};\n\n// main()\nPVt* curr = &SVT;\nvoid loop() {\n    Mode m = select_mode(batt, empty_q());\n    curr->exit(curr);\n    curr = get_strategy(m);\n    curr->enter(curr);\n}",
+      "pitfalls": [
+        "陷阱 1：策略切换竞争 → 改写指针进错睡眠模式 → 关中断或用 Mutex 保护",
+        "陷阱 2：saved_flags 不全 → 唤醒后外设时钟未恢复 → 扩展掩码至 PWR/RCC 所有影响位",
+        "陷阱 3：get_current 返回典型值非实时 → 电流估算误差大 → 加入 ADC 采样和温度校准"
+      ],
       "refBook": [
-        "《重构》ch2「重构原则」",
-        "《UNIX编程艺术》ch2「设计与规则」"
+        "《重构》ch5「构筑测试框架」",
+        "《重构》ch10「合并继承体系」"
       ]
     }
   ]
