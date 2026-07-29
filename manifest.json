@@ -1,6 +1,7 @@
 {
   "latest": "2026-05-05",
   "files": [
+    "daily/2026-07-29-architecture-principle.md",
     "daily/2026-05-05.json",
     "daily/architecture-principle-2026-07-28.md",
     "daily/2026-07-26-deep-read.md",
@@ -50,6 +51,7 @@
     "2026-05-04": "daily/2026-05-04.json",
     "2026-05-03": "daily/2026-05-03.json",
     "2026-05-02": "daily/2026-05-02.json",
-    "2026-07-28": "daily/architecture-principle-2026-07-28.md"
+    "2026-07-28": "daily/architecture-principle-2026-07-28.md",
+    "2026-07-29": "daily/2026-07-29-architecture-principle.md"
   }
 }
