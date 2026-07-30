@@ -12,19 +12,11 @@
       "toolchain": "LL",
       "snippetType": "pattern",
       "difficulty": "intermediate",
-      "tags": [
-        "DMA",
-        "环形缓冲区",
-        "抽象数据类型",
-        "信息隐藏"
-      ],
-      "explanation": "《C语言接口与实现》指出：抽象数据类型通过隐藏实现细节，将变化隔离在模块内部。DMA控制器的寄存器映射随芯片不同而变，如果应用层直接操作DMA寄存器，每次更换MCU都要重写整块驱动。把DMA传输参数、缓冲区管理封装为ADT，上层只需调用Dma_Buffer_Consume()读取数据——这是用少量中间层换取系统的可移植性和可维护性。代价是增加了函数调用开销和内存占用，但对UART/ADC这类非临界路径的IO，这种开销完全可以接受。\n\n架构核心是把三个关注点分离：(1) DMA硬件配置，由底层适配器完成；(2) 双缓冲轮换逻辑，由中间层管理；(3) 数据处理业务逻辑，由上层消费。依赖方向严格保持硬件依赖上层而非反过来——应用层不直接包含stm32f4xx.h，只依赖dma_buffer.h接口。《UNIX编程艺术》的模块原则在此体现为：每个DMA使用者都是一个独立小部件，通过标准缓冲区接口组合在一起。",
+      "tags": ["DMA", "环形缓冲区", "抽象数据类型", "信息隐藏"],
+      "explanation": "《C语言接口与实现》指出：抽象数据类型通过隐藏实现细节，将变化隔离在模块内部。DMA控制器的寄存器映射随芯片不同而变，如果应用层直接操作DMA寄存器，每次更换MCU都要重写整块驱动。把DMA传输参数、缓冲区管理封装为ADT，上层只需调用Dma_Buffer_Consume()读取数据——这是用少量中间层换取系统的可移植性和可维护性。代价是增加了函数调用开销和内存占用，但对UART/ADC这类非临界路径的IO，这种开销完全可以接受。架构核心是把三个关注点分离：(1) DMA硬件配置，由底层适配器完成；(2) 双缓冲轮换逻辑，由中间层管理；(3) 数据处理业务逻辑，由上层消费。依赖方向严格保持硬件依赖上层而非反过来——应用层不直接包含stm32f4xx.h，只依赖dma_buffer.h接口。《UNIX编程艺术》的模块原则在此体现为：每个DMA使用者都是一个独立小部件，通过标准缓冲区接口组合在一起。没有银弹，《人月神话》提醒我们任何架构都有权衡。",
       "code": "// dma_buffer.h —— 抽象数据类型接口\ntypedef struct DmaBuffer DmaBuffer;\n\n// 初始化：关联DMA通道、环形缓冲区大小和回调\nDmaBuffer* DmaBuffer_Create(DmaChannel* chan,\n                            uint8_t* ring_buf,\n                            size_t ring_size,\n                            DmaBuffer_Callback cb);\n\n// 开始DMA单次传输（触发一次采样或一帧接收）\nint DmaBuffer_Start(DmaBuffer* db);\n\n// 检查是否有新数据到达（非阻塞）\nbool DmaBuffer_HasData(DmaBuffer* db);\n\n// 拷贝一份有效数据到用户缓冲区（环形拷贝）\nsize_t DmaBuffer_Consume(DmaBuffer* db, void* out_buf, size_t max);\n\n// 返回当前已接收但未消费的字节数\nsize_t DmaBuffer_GetAvailable(DmaBuffer* db);\n\n// 清理资源\nvoid DmaBuffer_Destroy(DmaBuffer* db);",
       "pitfalls": [],
-      "refBook": [
-        "《C语言接口与实现》ch3「抽象数据类型」",
-        "《UNIX编程艺术》ch2「设计与规则」"
-      ]
+      "refBook": ["《C语言接口与实现》ch3「抽象数据类型」", "《UNIX编程艺术》ch2「设计与规则」"]
     },
     {
       "id": "2026-05-05-dma-snippet",
@@ -36,23 +28,15 @@
       "toolchain": "LL",
       "snippetType": "driver",
       "difficulty": "advanced",
-      "tags": [
-        "DMA",
-        "UART",
-        "循环缓冲区",
-        "半传中断"
-      ],
-      "explanation": "本例使用LL库配置UART的DMA循环模式+半传输中断切换双缓冲，实现连续无阻塞接收。关键点：DMA_CIRC使能后指针自动回绕，但需要在中断中判断是哪个缓冲区满才能正确处理。HAL库的USART_HandleTypeDef对初学者更友好，但LL更轻量可控。此处用两个各64字节的环形区交替填充，CPU处理一个区时另一个区正在被DMA填充，完美消除接收间隙。注意清除DMA半传标志的顺序：先读状态寄存器确认来源，再写清除位，否则可能漏掉中断。实际测试中，115200波特率下长时间运行无丢包，CPU占用率低于5%（仅用于拷贝数据）。",
-      "code": "#include \"stm32f4xx_ll_dma.h\"\n#include \"stm32f4xx_ll_usart.h\"\n\n#define RX_BUF_SIZE     64\n#define RX_BUFFERS      2\n\ntypedef struct {\n    uint8_t buf[RX_BUF_SIZE * RX_BUFFERS];\n    volatile uint16_t dma_half_idx;  // 半传中断时的索引（0-63）\n    volatile uint16_t cpu_consume_idx; // CPU消费偏移\n    volatile bool half_done;         // 半传标记\n} UartRxState;\n\nstatic UartRxState rx_state = {0};\n\n// DMA半传输中断：其中一个64字节缓冲区已满\nstatic void DMA1_Stream6_IRQHandler(void) {\n    if (LL_DMA_IsEnabledIRQ(DMA1, Stream6, IT_HT)) {\n        LL_DMA_ClearHTIF(DMA1, Stream6);\n        rx_state.half_done = true;\n        rx_state.dma_half_idx = RX_BUF_SIZE; // 第二个区开始写入\n    }\n}\n\n// 启动UART+DMA双缓冲连续接收\nvoid UartRx_Start(void) {\n    // 1. 清空状态\n    memset(rx_state.buf, 0, sizeof(rx_state.buf));\n    rx_state.cpu_consume_idx = 0;\n    rx_state.half_done = false;\n\n    // 2. 配置UART\n    LL_USART_SetBaudRate(USART2, SystemClock_GetFreq(), 115200);\n    LL_USART_SetFrameFormat(USART2, 8, USART_WORDLENGTH_8B, \n                           USART_PARITY_NONE, 1);\n    LL_USART_EnableIT_PE | IT_FRAMING | IT_ORE, USART2);\n\n    // 3. 配置DMA双缓冲区（非循环模式，用手动切换）\n    LL_DMA_ConfigChannel(DMA1, Stream6, USART2_DR_Address,\n                         LL_DMA_DIR_PERIPH_TO_MEMORY,\n                         LL_DMA_PERIPH_DATA_BYTE,\n                         LL_DMA_MEMORY_DATA_BYTE,\n                         LL_DMA_MODE_CIRCULAR, // DMA自动回绕指针\n                         LL_DMA_PRIORITY_HIGH);\n\n    // 4. 设置传输长度（一次性传128字节，两个缓冲区）\n    LL_DMA_SetTransferLength(DMA1, Stream6, RX_BUF_SIZE * RX_BUFFERS);\n\n    // 5. 使能DMA和UART\n    LL_DMA_EnableChannel(DMA1, Stream6);\n    LL_USART_EnableDMAReqRx(USART2);\n    LL_USART_Enable(USART2);\n}\n\n// 在主轮询中检查并拷贝数据\nvoid UartRx_Process(void) {\n    if (rx_state.half_done) {\n        // DMA刚刚写完第二个64字节区（offset 64-127）\n        // 这里可以异步标记有数据，由主线程处理\n        rx_state.half_done = false;\n    }\n\n    // 计算可读字节：当前DMA位置减去CPU消费位置\n    uint16_t dma_pos = rx_state.dma_half_idx + RX_BUF_SIZE;\n    uint16_t available = (dma_pos - rx_state.cpu_consume_idx) % \n                         (RX_BUF_SIZE * RX_BUFFERS);\n    if (available > 0) {\n        memcpy(read_buf, rx_state.buf + rx_state.cpu_consume_idx, available);\n        rx_state.cpu_consume_idx += available;\n    }\n}",
+      "tags": ["DMA", "UART", "循环缓冲区", "半传中断"],
+      "explanation": "本例使用LL库配置UART的DMA循环模式+半传输中断切换双缓冲，实现连续无阻塞接收。关键点：DMA_CIRC使能后指针自动回绕，但需要在中断中判断是哪个缓冲区满才能正确处理。HAL库的USART_HandleTypeDef对初学者更友好，但LL更轻量可控。此处用两个各64字节的环形区交替填充，CPU处理一个区时另一个区正在被DMA填充，完美消除接收间隙。注意清除DMA半传标志的顺序：先读状态寄存器确认来源，再写清除位，否则可能漏掉中断。实际测试中，115200波特率下长时间运行无丢包，CPU占用率低于5%（仅用于拷贝数据）。《代码大全》强调防御性编程，确保每一步都有检查和验证。「你的代码必须假设硬件可能会做任何事。」——《代码大全》第5章",
+      "code": "#include \"stm32f4xx_ll_dma.h\"\n#include \"stm32f4xx_ll_usart.h\"\n\n#define RX_BUF_SIZE     64\n#define RX_BUFFERS      2\ntypedef struct {\n    uint8_t buf[RX_BUF_SIZE * RX_BUFFERS];\n    volatile uint16_t dma_half_idx;  // 半传中断时的索引（0-63）\n    volatile uint16_t cpu_consume_idx; // CPU消费偏移\n    volatile bool half_done;         // 半传标记\n} UartRxState;\n\nstatic UartRxState rx_state = {0};\n\n// DMA半传输中断：其中一个64字节缓冲区已满\nstatic void DMA1_Stream6_IRQHandler(void) {\n    if (LL_DMA_IsEnabledIRQ(DMA1, Stream6, IT_HT)) {\n        LL_DMA_ClearHTIF(DMA1, Stream6);\n        rx_state.half_done = true;\n        rx_state.dma_half_idx = RX_BUF_SIZE; // 第二个区开始写入\n    }\n}\n\n// 启动UART+DMA双缓冲连续接收\nvoid UartRx_Start(void) {\n    // 1. 清空状态\n    memset(rx_state.buf, 0, sizeof(rx_state.buf));\n    rx_state.cpu_consume_idx = 0;\n    rx_state.half_done = false;\n\n    // 2. 配置UART\n    LL_USART_SetBaudRate(USART2, SystemClock_GetFreq(), 115200);\n    LL_USART_SetFrameFormat(USART2, 8, USART_WORDLENGTH_8B,\n                           USART_PARITY_NONE, 1);\n    LL_USART_EnableIT_PE | IT_FRAMING | IT_ORE, USART2);\n\n    // 3. 配置DMA双缓冲区（非循环模式，用手动切换）\n    LL_DMA_ConfigChannel(DMA1, Stream6, USART2_DR_Address,\n                         LL_DMA_DIR_PERIPH_TO_MEMORY,\n                         LL_DMA_PERIPH_DATA_BYTE,\n                         LL_DMA_MEMORY_DATA_BYTE,\n                         LL_DMA_MODE_CIRCULAR, // DMA自动回绕指针\n                         LL_DMA_PRIORITY_HIGH);\n\n    // 4. 设置传输长度（一次性传128字节，两个缓冲区）\n    LL_DMA_SetTransferLength(DMA1, Stream6, RX_BUF_SIZE * RX_BUFFERS);\n\n    // 5. 使能DMA和UART\n    LL_DMA_EnableChannel(DMA1, Stream6);\n    LL_USART_EnableDMAReqRx(USART2);\n    LL_USART_Enable(USART2);\n}\n\n// 在主轮询中检查并拷贝数据\nvoid UartRx_Process(void) {\n    if (rx_state.half_done) {\n        // DMA刚刚写完第二个64字节区（offset 64-127）\n        // 这里可以异步标记有数据，由主线程处理\n        rx_state.half_done = false;\n    }\n\n    // 计算可读字节：当前DMA位置减去CPU消费位置\n    uint16_t dma_pos = rx_state.dma_half_idx + RX_BUF_SIZE;\n    uint16_t available = (dma_pos - rx_state.cpu_consume_idx) % \n                         (RX_BUF_SIZE * RX_BUFFERS);\n    if (available > 0) {\n        memcpy(read_buf, rx_state.buf + rx_state.cpu_consume_idx, available);\n        rx_state.cpu_consume_idx += available;\n    }\n}",
       "pitfalls": [
         "陷阱 1：清除中断标志顺序错——先写清除位再读状态寄存器会丢失来源判断，应在LL_DMA_ClearHTIF前先用LL_DMA_IsEnabledIRQ确认是哪个中断源触发",
         "陷阱 2：未考虑中断嵌套优先级——DMA半传中断优先级必须高于业务处理逻辑，否则CPU处理不过来导致缓冲区覆盖，建议在NVIC中设置DMA1_Stream6_IRQn为优先级2",
         "陷阱 3：double copy问题——上面代码中直接从环形缓冲区memcpy到read_buf是正确的；如果在半传中断里也做拷贝，会造成额外开销和数据不一致"
       ],
-      "refBook": [
-        "《代码大全》ch6「构筑程序」",
-        "《C陷阱与缺陷》ch3「预处理"
-      ]
+      "refBook": ["《代码大全》ch6「构筑程序」", "《C陷阱与缺陷》ch3「预处理"]
     },
     {
       "id": "2026-05-05-dma-tip",
@@ -64,13 +48,8 @@
       "toolchain": "通用",
       "snippetType": "note",
       "difficulty": "intermediate",
-      "tags": [
-        "DMA",
-        "缓冲区溢出",
-        "竞态条件",
-        "硬件特性"
-      ],
-      "explanation": "你以为你控制了DMA，其实DMA在控制你。 《C陷阱与缺陷》开篇警告未定义行为能在最意想不到的地方造成系统级灾难。七个真实陷阱直指让DMA传输失败、数据丢失或功耗异常的隐蔽问题。",
+      "tags": ["DMA", "缓冲区溢出", "竞态条件", "硬件特性"],
+      "explanation": "你以为你控制了DMA，其实DMA在控制你。 《C陷阱与缺陷》开篇警告未定义行为能在最意想不到的地方造成系统级灾难。七个真实陷阱直指让DMA传输失败、数据丢失或功耗异常的隐蔽问题。《人月神话》告诫我们：「向进度落后的项目增加人手，只会让进度更加落后。」DMA调试也是如此——你以为多加几个volatile就能解决所有问题，但实际上每个新增的同步点都可能引入新的竞态窗口。「计划再计划——每个估计都要加倍，因为总会发现你遗漏了什么。",
       "code": "// BAD: 危险的双缓冲实现——缺少同步保护\nuint8_t* get_current_buf() {\n    return (rx_state.dma_idx < RX_BUF_SIZE) ? \n           rx_state.buf[0] : rx_state.buf[1];\n}\n\nvoid process_data() {\n    uint8_t* buf = get_current_buf();\n    // DMA可能在读取期间切换缓冲区！\n    consume(buf, RX_BUF_SIZE);\n}\n\n// GOOD：使用序列号保护\nuint8_t* get_safe_buf(uint16_t seq_expected) {\n    if (rx_state.seq == seq_expected) return rx_state.buf[rx_state.cur_idx];\n    return NULL; // 数据无效，等待重新同步\n}",
       "pitfalls": [
         "陷阱 1：缓冲区覆盖未检测——CPU消费速度跟不上DMA填充速度时，旧数据被新数据覆盖而无任何通知。修复：在DmaBuffer_GetAvailable()中实现回绕检查，当可用字节≥缓冲区大小一半时丢弃部分或触发高水位告警。",
@@ -81,10 +60,7 @@
         "陷阱 6：循环模式下长度超出缓冲区范围——设置传输长度为128但缓冲区只有64，DMA会写到非法内存地址。修复：在循环模式下，传输长度必须≤缓冲区物理大小，指针回绕由硬件自动处理。",
         "陷阱 7：多通道DMA资源冲突——ADC和UART同时使用DMA同一组通道（如DMA1_Channel2和DMA1_Channel5在某些STM32上共享仲裁器），导致传输被阻塞。修复：查参考手册的DMA资源映射表，分散使用不同DMA控制器（DMA1 vs DMA2）或调整通道优先级。"
       ],
-      "refBook": [
-        "《C陷阱与缺陷》ch1「前言」",
-        "《人月神话》ch2「计划再计划"
-      ]
+      "refBook": ["《C陷阱与缺陷》ch1「前言」", "《人月神话》ch2「计划再计划」"]
     },
     {
       "id": "2026-05-05-dma-refactor",
@@ -96,23 +72,15 @@
       "toolchain": "HAL",
       "snippetType": "driver",
       "difficulty": "intermediate",
-      "tags": [
-        "重构",
-        "策略模式",
-        "DMA",
-        "代码坏味道"
-      ],
-      "explanation": "\"先求正确，再求高效。\" 《重构》第1章。原始代码中多个DMA使用者共用同一个初始化函数，靠if-else选择模式和长度，这是典型的霰弹式修改坏味道——新增一个ADC通道就要改同一个函数。引入DMA传输策略模式后，每种配置成为独立的策略类，主循环只依赖IDmaStrategy接口。符合《重构》ch10合并继承体系的建议：将条件分支转化为多态，开闭原则自然达成。代价是约30%的代码量增加和策略对象的小幅RAM占用，但可测试性大幅提升（每个策略可单独mock验证），且新功能无需触碰已有代码。",
+      "tags": ["重构", "策略模式", "DMA", "代码坏味道"],
+      "explanation": "\"先求正确，再求高效。\" 《重构》第1章。原始代码中多个DMA使用者共用同一个初始化函数，靠if-else选择模式和长度，这是典型的霰弹式修改坏味道——新增一个ADC通道就要改同一个函数。引入DMA传输策略模式后，每种配置成为独立的策略类，主循环只依赖IDmaStrategy接口。符合《重构》ch10合并继承体系的建议：将条件分支转化为多态，开闭原则自然达成。代价是约30%的代码量增加和策略对象的小幅RAM占用，但可测试性大幅提升（每个策略可单独mock验证），且新功能无需触碰已有代码。「任何傻瓜都能写出计算机理解的代码。好的程序员写人能理解的代码。」——《重构》第2版序言",
       "code": "// idma_strategy.h —— 策略接口\ntypedef struct IDmaStrategy IDmaStrategy;\n\ntypedef struct {\n    void (*init)(IDmaStrategy* self, Udma_context* ctx);\n    void (*start)(IDmaStrategy* self);\n    void (*cleanup)(IDmaStrategy* self);\n} IDmaStrategyVtbl;\n\nstruct IDmaStrategy {\n    const IDmaStrategyVtbl* vtbl;\n    Udma_context* ctx;\n    uint16_t buffer_len;\n};\n\n// adc_dma_strategy.c —— ADC专用策略\nstatic void adc_init(IDmaStrategy* self, Udma_context* ctx) {\n    self->ctx = ctx;\n    self->buffer_len = ADC_BUFFER_SZ;\n    // 仅配置ADC相关的DMA通道和循环模式\n    LL_ADC_ConfigDMA(self->ctx->adc_instance, \n                     LL_DMA_PERIPH_DIRECTION_PERIPH_TO_MEMORY,\n                     LL_DMA_MODE_CIRCULAR,\n                     LL_DMA_PRIORITY_HIGH);\n}\n\nstatic void adc_start(IDmaStrategy* self) {\n    ADC_StartConversion(self->ctx->adc_instance);\n}\n\nstatic const IDmaStrategyVtbl ADC_STRATEGY_VTABLE = {\n    .init = adc_init,\n    .start = adc_start,\n    .cleanup = NULL\n};\n\nstatic ADC_DmaStrategy adc_strat = {\n    .vtbl = &ADC_STRATEGY_VTABLE,\n    .ctx = NULL,\n    .buffer_len = 0\n};\n\n// uart_dma_strategy.c —— UART专用策略\nstatic void uart_init(IDmaStrategy* self, Udma_context* ctx) {\n    self->ctx = ctx;\n    self->buffer_len = UART_RX_BUF;\n    LL_UART_ConfigDMA(self->ctx->uart_instance,\n                      LL_DMA_DIR_PERIPH_TO_MEMORY,\n                      LL_DMA_MODE_CIRCULAR,\n                      LL_DMA_PRIORITY_MEDIUM);\n}\n\nstatic void uart_start(IDmaStrategy* self) {\n    LL_UART_EnableDMAReqRx(self->ctx->uart_instance);\n}\n\nconst IDmaStrategy VTABLE_UART = {\n    .init = uart_init,\n    .start = uart_start,\n    .cleanup = NULL\n};\n\n// main.c —— 统一入口\nvoid System_Init(Udma_context* ctx) {\n    // 根据运行时选择策略：ADC或UART\n    IDmaStrategy* dma_dev = (use_adc) ? \n        (IDmaStrategy*)&adc_strat : (IDmaStrategy*)&uart_strat;\n    dma_dev->vtbl->init(dma_dev, ctx);\n    dma_dev->vtbl->start(dma_dev);\n}",
       "pitfalls": [
         "陷阱 1：策略对象生命周期——策略对象如果是局部变量，退出作用域后虚函数表指针会失效。修复：将策略对象定义为static或全局常量，确保VTABLE持久有效",
         "陷阱 2：上下文泄露——不同策略复用了同一个Udma_context结构体，ADC策略误写UART的DMA通道寄存器。修复：在每个strategy的init阶段验证ctx的有效性，或使用context_per_strategy隔离",
         "陷阱 3：缺少统一exit接口——后续如果要加停止功能，每个策略都要添加新的虚函数，破坏闭开原则。修复：提前定义_cleanup虚函数，即使当前为空也能扩展"
       ],
-      "refBook": [
-        "《重构》ch5「构筑测试框架」",
-        "《重构》ch10「合并继承体系"
-      ]
+      "refBook": ["《重构》ch5「构筑测试框架」", "《重构》ch10「合并继承体系"]
     }
   ]
 }
